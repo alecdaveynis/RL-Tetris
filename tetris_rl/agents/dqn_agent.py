@@ -10,6 +10,8 @@ placement from its state-action feature vector:
 At decision time we enumerate legal placements, compute φ for each, and pick
 argmax_a Q(s, a) (ε-greedy during training). Bellman targets bootstrap from
 max over legal next actions (or Double DQN: online argmax, target evaluation).
+
+True terminals (game over) do not bootstrap. Time-limit truncations do.
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ from tetris_rl.features import (
     state_action_features,
 )
 from tetris_rl.training.replay_buffer import ReplayBuffer, Transition
+
+CHECKPOINT_VERSION = 2
 
 
 @dataclass
@@ -69,14 +73,7 @@ def original_dqn_config(**overrides: Any) -> DQNConfig:
 
 
 def improved_dqn_config(**overrides: Any) -> DQNConfig:
-    """
-    Post-audit defaults (config B): Double DQN, moderate LR, delta-friendly
-    exploration horizon, more frequent target sync, input LayerNorm.
-
-    Note: epsilon_decay_steps=15_000 reaches ε≈0.05 by ~15k env steps so that
-    short equal-budget runs (e.g. 400 episodes) still leave time for greedy
-    learning. Increase for multi-thousand-episode training.
-    """
+    """Post-audit defaults (config B). Network/reward weights unchanged here."""
     cfg = DQNConfig(
         lr=5e-4,
         double_dqn=True,
@@ -153,6 +150,8 @@ class DQNAgent:
         self.total_steps = 0
         self.grad_steps = 0
         self.learn_steps = 0
+        self.best_eval_score = -float("inf")
+        self.episodes_trained = 0
 
     def name(self) -> str:
         return "dqn"
@@ -189,14 +188,34 @@ class DQNAgent:
         env_before_features: np.ndarray,
         reward: float,
         env: TetrisEnv,
-        done: bool,
+        terminated: bool = False,
+        truncated: bool = False,
+        *,
+        done: Optional[bool] = None,
     ) -> None:
-        """Store transition after env.step; next features from current legal set."""
-        if done:
+        """
+        Store transition after env.step.
+
+        Bellman bootstrap is disabled only when ``terminated`` (true game over).
+        Truncations (e.g. max-pieces cap) still store next-action features and
+        bootstrap. Legacy ``done=True`` is treated as terminated.
+        """
+        if done is not None:
+            terminated = bool(done)
+            truncated = False
+
+        if terminated:
             next_feats = np.zeros((0, self.feature_dim), dtype=np.float32)
         else:
+            # Includes truncated episodes: bootstrap from the post-step legal set.
             next_feats = placement_feature_batch(env.engine, env.legal_placements())
-        self.buffer.add(env_before_features, reward, next_feats, done)
+
+        self.buffer.add(
+            env_before_features,
+            reward,
+            next_feats,
+            terminated=bool(terminated),
+        )
         self.total_steps += 1
         self._decay_epsilon()
 
@@ -224,74 +243,170 @@ class DQNAgent:
 
         return float(loss.item())
 
-    def _compute_loss(self, batch: list[Transition]) -> torch.Tensor:
+    def _pad_next_actions(
+        self, batch: list[Transition]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Stack next-action features to (B, A_max, F) with a boolean mask."""
+        bsz = len(batch)
+        lengths = [0 if t.terminated else int(t.next_state_actions.shape[0]) for t in batch]
+        max_a = max(lengths) if lengths else 0
+        if max_a == 0:
+            feats = torch.zeros(bsz, 0, self.feature_dim, device=self.device)
+            mask = torch.zeros(bsz, 0, dtype=torch.bool, device=self.device)
+            return feats, mask
+
+        feats = torch.zeros(bsz, max_a, self.feature_dim, device=self.device)
+        mask = torch.zeros(bsz, max_a, dtype=torch.bool, device=self.device)
+        for i, t in enumerate(batch):
+            n = lengths[i]
+            if n == 0:
+                continue
+            feats[i, :n] = torch.as_tensor(
+                t.next_state_actions, dtype=torch.float32, device=self.device
+            )
+            mask[i, :n] = True
+        return feats, mask
+
+    def _next_q_max_vectorized(
+        self, next_feats: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute bootstrap values for a padded next-action batch.
+
+        next_feats: (B, A, F), mask: (B, A). Returns (B,).
+        """
+        bsz, max_a, feat_dim = next_feats.shape
+        if max_a == 0:
+            return torch.zeros(bsz, dtype=torch.float32, device=self.device)
+
+        flat = next_feats.reshape(bsz * max_a, feat_dim)
         cfg = self.config
+
+        if cfg.double_dqn:
+            q_online = self.online(flat).reshape(bsz, max_a)
+            q_target = self.target(flat).reshape(bsz, max_a)
+            # Mask illegal / pad slots before argmax.
+            q_online_masked = q_online.masked_fill(~mask, -1e9)
+            best = q_online_masked.argmax(dim=1)
+            gathered = q_target.gather(1, best.unsqueeze(1)).squeeze(1)
+            has_any = mask.any(dim=1)
+            return torch.where(has_any, gathered, torch.zeros_like(gathered))
+
+        q_target = self.target(flat).reshape(bsz, max_a)
+        q_masked = q_target.masked_fill(~mask, -1e9)
+        vals, _ = q_masked.max(dim=1)
+        has_any = mask.any(dim=1)
+        return torch.where(has_any, vals, torch.zeros_like(vals))
+
+    def _next_q_max_loop(self, batch: list[Transition]) -> torch.Tensor:
+        """Reference per-sample loop (for tests / benchmarks)."""
+        cfg = self.config
+        next_q_max = torch.zeros(len(batch), dtype=torch.float32, device=self.device)
+        for i, t in enumerate(batch):
+            if t.terminated or t.next_state_actions.shape[0] == 0:
+                next_q_max[i] = 0.0
+                continue
+            next_x = torch.as_tensor(
+                t.next_state_actions, dtype=torch.float32, device=self.device
+            )
+            if cfg.double_dqn:
+                q_online = self.online(next_x)
+                best = int(torch.argmax(q_online).item())
+                next_q_max[i] = self.target(next_x[best : best + 1])[0]
+            else:
+                next_q_max[i] = self.target(next_x).max()
+        return next_q_max
+
+    def bellman_targets(
+        self, batch: list[Transition], *, vectorized: bool = True
+    ) -> torch.Tensor:
+        """Compute Bellman targets for a batch (no grad). Useful for tests."""
+        cfg = self.config
+        rewards = torch.as_tensor(
+            [t.reward for t in batch], dtype=torch.float32, device=self.device
+        )
+        terminated = torch.as_tensor(
+            [t.terminated for t in batch], dtype=torch.float32, device=self.device
+        )
+        with torch.no_grad():
+            if vectorized:
+                next_feats, mask = self._pad_next_actions(batch)
+                next_q_max = self._next_q_max_vectorized(next_feats, mask)
+            else:
+                next_q_max = self._next_q_max_loop(batch)
+            return rewards + cfg.gamma * next_q_max * (1.0 - terminated)
+
+    def _compute_loss(self, batch: list[Transition]) -> torch.Tensor:
         sa = torch.as_tensor(
             np.stack([t.state_action for t in batch], axis=0),
             dtype=torch.float32,
             device=self.device,
         )
-        rewards = torch.as_tensor(
-            [t.reward for t in batch], dtype=torch.float32, device=self.device
-        )
-        dones = torch.as_tensor(
-            [t.done for t in batch], dtype=torch.float32, device=self.device
-        )
-
         self.online.train()
         q_sa = self.online(sa)
-
-        # Bootstrap max Q over legal next actions (variable count per sample).
         with torch.no_grad():
-            next_q_max = torch.zeros(len(batch), dtype=torch.float32, device=self.device)
-            for i, t in enumerate(batch):
-                if t.done or t.next_state_actions.shape[0] == 0:
-                    next_q_max[i] = 0.0
-                    continue
-                next_x = torch.as_tensor(
-                    t.next_state_actions, dtype=torch.float32, device=self.device
-                )
-                if cfg.double_dqn:
-                    # Online network selects action; target evaluates it.
-                    q_online = self.online(next_x)
-                    best = int(torch.argmax(q_online).item())
-                    next_q_max[i] = self.target(next_x[best : best + 1])[0]
-                else:
-                    next_q_max[i] = self.target(next_x).max()
-
-            targets = rewards + cfg.gamma * next_q_max * (1.0 - dones)
-
+            targets = self.bellman_targets(batch, vectorized=True)
         return F.smooth_l1_loss(q_sa, targets)
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "online": self.online.state_dict(),
-                "target": self.target.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "config": asdict(self.config),
-                "epsilon": self.epsilon,
-                "total_steps": self.total_steps,
-                "grad_steps": self.grad_steps,
-                "learn_steps": self.learn_steps,
-            },
-            path,
-        )
+        payload: dict[str, Any] = {
+            "checkpoint_version": CHECKPOINT_VERSION,
+            "online": self.online.state_dict(),
+            "target": self.target.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+            "config": asdict(self.config),
+            "epsilon": self.epsilon,
+            "total_steps": self.total_steps,
+            "grad_steps": self.grad_steps,
+            "learn_steps": self.learn_steps,
+            "best_eval_score": self.best_eval_score,
+            "episodes_trained": self.episodes_trained,
+            "buffer": self.buffer.state_dict(),
+            "agent_rng_state": self.rng.bit_generator.state,
+            "torch_rng_state": torch.get_rng_state(),
+            "numpy_rng_state": np.random.get_state(),
+        }
+        if self.device.type == "cuda":
+            payload["cuda_rng_state"] = torch.cuda.get_rng_state()
+        torch.save(payload, path)
 
     def load(self, path: str | Path, load_optimizer: bool = True) -> None:
         path = Path(path)
-        # weights_only=False: checkpoint includes config dict / non-tensor fields.
         ckpt: dict[str, Any] = torch.load(path, map_location=self.device, weights_only=False)
         self.online.load_state_dict(ckpt["online"])
         self.target.load_state_dict(ckpt["target"])
         if load_optimizer and "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            try:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            except Exception:
+                # Architecture/hparams mismatch on older checkpoints — keep fresh opt.
+                pass
         self.epsilon = float(ckpt.get("epsilon", self.config.epsilon_end))
         self.total_steps = int(ckpt.get("total_steps", 0))
         self.grad_steps = int(ckpt.get("grad_steps", 0))
         self.learn_steps = int(ckpt.get("learn_steps", 0))
+        self.best_eval_score = float(ckpt.get("best_eval_score", -float("inf")))
+        self.episodes_trained = int(ckpt.get("episodes_trained", 0))
+
+        if "buffer" in ckpt and ckpt["buffer"] is not None:
+            self.buffer.load_state_dict(ckpt["buffer"])
+
+        if "agent_rng_state" in ckpt and ckpt["agent_rng_state"] is not None:
+            self.rng.bit_generator.state = ckpt["agent_rng_state"]
+
+        if "torch_rng_state" in ckpt and ckpt["torch_rng_state"] is not None:
+            torch.set_rng_state(ckpt["torch_rng_state"])
+        if "numpy_rng_state" in ckpt and ckpt["numpy_rng_state"] is not None:
+            np.random.set_state(ckpt["numpy_rng_state"])
+        if (
+            self.device.type == "cuda"
+            and "cuda_rng_state" in ckpt
+            and ckpt["cuda_rng_state"] is not None
+        ):
+            torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+
         self.online.to(self.device)
         self.target.to(self.device)
 
@@ -305,12 +420,16 @@ class DQNAgent:
         path = Path(path)
         ckpt = torch.load(path, map_location=device or "cpu", weights_only=False)
         cfg_dict = ckpt.get("config", {})
-        # Filter unknown keys for forward compatibility
         valid = {f.name for f in DQNConfig.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         cfg = DQNConfig(**{k: v for k, v in cfg_dict.items() if k in valid})
         if device is not None:
             cfg.device = device
+        # Avoid re-seeding from config.seed before load restores RNG states.
+        seed = cfg.seed
+        cfg.seed = None
         agent = cls(cfg)
+        cfg.seed = seed
+        agent.config.seed = seed
         agent.load(path)
         if not explore:
             agent.epsilon = 0.0

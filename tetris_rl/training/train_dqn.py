@@ -12,7 +12,7 @@ import csv
 import json
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 
@@ -24,6 +24,11 @@ from tetris_rl.agents.dqn_agent import (
 )
 from tetris_rl.environment import TetrisEnv
 from tetris_rl.rewards import LegacyRewardConfig, RewardConfig
+
+# Fixed validation seeds for model selection (disjoint from final test seeds 0..N).
+VALIDATION_SEEDS: tuple[int, ...] = tuple(range(100_000, 100_050))
+# Final held-out test seed base used by evaluation.compare / compare_ab.
+TEST_SEED_BASE = 0
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -52,7 +57,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--no-double-dqn", action="store_true")
     p.add_argument("--train-freq", type=int, default=1, help="Gradient steps per env step")
     p.add_argument("--eval-every", type=int, default=100, help="Episodes between greedy evals")
-    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument(
+        "--eval-games",
+        type=int,
+        default=50,
+        help="Validation games (capped to len(VALIDATION_SEEDS)=50)",
+    )
     p.add_argument("--max-pieces", type=int, default=500, help="Safety cap per episode")
     p.add_argument("--checkpoint-dir", type=str, default="models")
     p.add_argument("--log-dir", type=str, default="results/train_logs")
@@ -107,21 +117,39 @@ def resolve_device(requested: Optional[str]) -> str:
     return "cpu"
 
 
-def evaluate_greedy(agent: DQNAgent, n_games: int, seed: int, max_pieces: int) -> dict:
-    """Run greedy (ε=0) evaluation games; report score/lines metrics."""
+def evaluate_greedy(
+    agent: DQNAgent,
+    max_pieces: int,
+    seeds: Optional[Sequence[int]] = None,
+    n_games: Optional[int] = None,
+) -> dict:
+    """
+    Run greedy (ε=0) games on fixed validation seeds.
+
+    Default seeds are VALIDATION_SEEDS (disjoint from final test seeds starting
+    at TEST_SEED_BASE). Does not mutate exploration schedule permanently.
+    """
+    if seeds is None:
+        seeds = VALIDATION_SEEDS
+    if n_games is not None:
+        seeds = list(seeds)[:n_games]
+
     old_eps = agent.epsilon
     agent.epsilon = 0.0
     scores, lines, pieces = [], [], []
-    for i in range(n_games):
-        env = TetrisEnv(seed=seed + 10_000 + i)
-        obs, info = env.reset(seed=seed + 10_000 + i)
-        done = False
-        while not done and env.engine.pieces_placed < max_pieces:
+    for seed in seeds:
+        env = TetrisEnv(seed=int(seed))
+        _, info = env.reset(seed=int(seed))
+        terminated = truncated = False
+        while not terminated and not truncated:
             if info["n_legal"] == 0:
                 break
+            if env.engine.pieces_placed >= max_pieces:
+                truncated = True
+                break
             action = agent.select_action(env, explore=False)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
+            _, _, terminated, trunc_env, info = env.step(action)
+            truncated = bool(trunc_env) or env.engine.pieces_placed >= max_pieces
         scores.append(env.engine.score)
         lines.append(env.engine.lines_cleared_total)
         pieces.append(env.engine.pieces_placed)
@@ -130,6 +158,7 @@ def evaluate_greedy(agent: DQNAgent, n_games: int, seed: int, max_pieces: int) -
         "mean_score": float(np.mean(scores)),
         "mean_lines": float(np.mean(lines)),
         "mean_pieces": float(np.mean(pieces)),
+        "n_games": len(scores),
     }
 
 
@@ -148,8 +177,10 @@ def train(args: argparse.Namespace) -> Path:
 
     if args.resume:
         agent = DQNAgent.from_checkpoint(args.resume, device=device, explore=True)
-        # Keep training epsilon schedule from checkpoint state
-        print(f"Resumed from {args.resume} (steps={agent.total_steps}, eps={agent.epsilon:.3f})")
+        print(
+            f"Resumed from {args.resume} (steps={agent.total_steps}, eps={agent.epsilon:.3f}, "
+            f"best_eval={agent.best_eval_score:.1f}, buffer={len(agent.buffer)})"
+        )
     else:
         agent = DQNAgent(cfg)
 
@@ -177,6 +208,8 @@ def train(args: argparse.Namespace) -> Path:
             "epsilon",
             "loss",
             "steps",
+            "terminated",
+            "truncated",
         ],
     )
     if write_header:
@@ -189,29 +222,39 @@ def train(args: argparse.Namespace) -> Path:
         "episodes": args.episodes,
         "seed": args.seed,
         "device": device,
+        "validation_seeds": list(VALIDATION_SEEDS),
+        "test_seed_base": TEST_SEED_BASE,
     }
     (log_dir / "run_config.json").write_text(json.dumps(meta, indent=2, default=str))
 
-    best_eval = -float("inf")
-    global_loss_sum = 0.0
-    global_loss_count = 0
+    # Preserve best score across resumed runs.
+    best_eval = agent.best_eval_score
     t0 = time.time()
+    n_val = min(args.eval_games, len(VALIDATION_SEEDS))
 
     for ep in range(1, args.episodes + 1):
         env = TetrisEnv(seed=args.seed + ep, reward_config=reward_cfg)
-        obs, info = env.reset(seed=args.seed + ep)
+        _, info = env.reset(seed=args.seed + ep)
         ep_reward = 0.0
         losses: list[float] = []
-        done = False
+        terminated = False
+        truncated = False
 
-        while not done and env.engine.pieces_placed < args.max_pieces:
+        while not terminated and not truncated:
             if info["n_legal"] == 0:
                 break
             action = agent.select_action(env, explore=True)
             sa_feats = agent.features_for_action(env, action)
-            obs, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            agent.observe(sa_feats, float(reward), env, done)
+            _, reward, terminated, trunc_env, info = env.step(action)
+            # Distinguish true terminal (game over) from piece-cap truncation.
+            truncated = bool(trunc_env) or (env.engine.pieces_placed >= args.max_pieces)
+            agent.observe(
+                sa_feats,
+                float(reward),
+                env,
+                terminated=bool(terminated),
+                truncated=truncated,
+            )
             ep_reward += float(reward)
 
             for _ in range(args.train_freq):
@@ -219,9 +262,8 @@ def train(args: argparse.Namespace) -> Path:
                     loss = agent.train_step()
                     if loss is not None:
                         losses.append(loss)
-                        global_loss_sum += loss
-                        global_loss_count += 1
 
+        agent.episodes_trained += 1
         mean_loss = float(np.mean(losses)) if losses else float("nan")
         row = {
             "episode": ep,
@@ -232,51 +274,57 @@ def train(args: argparse.Namespace) -> Path:
             "epsilon": agent.epsilon,
             "loss": mean_loss,
             "steps": agent.total_steps,
+            "terminated": int(terminated),
+            "truncated": int(truncated),
         }
         csv_writer.writerow(row)
         csv_file.flush()
 
         if writer is not None:
-            writer.add_scalar("train/score", row["score"], ep)
-            writer.add_scalar("train/lines", row["lines"], ep)
-            writer.add_scalar("train/episode_reward", ep_reward, ep)
-            writer.add_scalar("train/epsilon", agent.epsilon, ep)
+            writer.add_scalar("train/score", row["score"], agent.episodes_trained)
+            writer.add_scalar("train/lines", row["lines"], agent.episodes_trained)
+            writer.add_scalar("train/episode_reward", ep_reward, agent.episodes_trained)
+            writer.add_scalar("train/epsilon", agent.epsilon, agent.episodes_trained)
             if losses:
-                writer.add_scalar("train/loss", mean_loss, ep)
+                writer.add_scalar("train/loss", mean_loss, agent.episodes_trained)
 
         if ep % 10 == 0 or ep == 1:
             elapsed = time.time() - t0
             print(
                 f"ep={ep:5d} score={row['score']:5d} lines={row['lines']:3d} "
                 f"pieces={row['pieces']:3d} R={ep_reward:7.2f} eps={agent.epsilon:.3f} "
-                f"loss={mean_loss:.4f} steps={agent.total_steps} ({elapsed:.1f}s)"
+                f"loss={mean_loss:.4f} steps={agent.total_steps} "
+                f"T/Tr={int(terminated)}/{int(truncated)} ({elapsed:.1f}s)"
             )
 
         if ep % args.save_every == 0:
-            ckpt = checkpoint_dir / f"dqn_ep{ep}.pt"
-            agent.save(ckpt)
+            agent.best_eval_score = best_eval
+            agent.save(checkpoint_dir / f"dqn_ep{ep}.pt")
             agent.save(checkpoint_dir / "dqn_latest.pt")
 
         if args.eval_every > 0 and ep % args.eval_every == 0:
-            metrics = evaluate_greedy(agent, args.eval_games, args.seed, args.max_pieces)
+            metrics = evaluate_greedy(agent, args.max_pieces, n_games=n_val)
             print(
-                f"  [eval] mean_score={metrics['mean_score']:.1f} "
+                f"  [val n={metrics['n_games']}] mean_score={metrics['mean_score']:.1f} "
                 f"mean_lines={metrics['mean_lines']:.2f} "
-                f"mean_pieces={metrics['mean_pieces']:.1f}"
+                f"mean_pieces={metrics['mean_pieces']:.1f} "
+                f"(best={best_eval:.1f})"
             )
             if writer is not None:
-                writer.add_scalar("eval/mean_score", metrics["mean_score"], ep)
-                writer.add_scalar("eval/mean_lines", metrics["mean_lines"], ep)
+                writer.add_scalar("val/mean_score", metrics["mean_score"], agent.episodes_trained)
+                writer.add_scalar("val/mean_lines", metrics["mean_lines"], agent.episodes_trained)
             if metrics["mean_score"] >= best_eval:
                 best_eval = metrics["mean_score"]
+                agent.best_eval_score = best_eval
                 agent.save(checkpoint_dir / "dqn_best.pt")
 
+    agent.best_eval_score = best_eval
     agent.save(checkpoint_dir / "dqn_final.pt")
     agent.save(checkpoint_dir / "dqn_latest.pt")
     csv_file.close()
     if writer is not None:
         writer.close()
-    print(f"Training complete. Checkpoints in {checkpoint_dir}")
+    print(f"Training complete. Checkpoints in {checkpoint_dir} (best_eval={best_eval:.1f})")
     return checkpoint_dir / "dqn_final.pt"
 
 

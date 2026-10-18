@@ -47,7 +47,9 @@ def test_double_dqn_train_step():
         action = agent.select_action(env, explore=True)
         sa = agent.features_for_action(env, action)
         _, reward, terminated, truncated, _ = env.step(action)
-        agent.observe(sa, float(reward), env, terminated or truncated)
+        agent.observe(
+            sa, float(reward), env, terminated=bool(terminated), truncated=bool(truncated)
+        )
         if terminated or truncated:
             env.reset()
     loss = agent.train_step()
@@ -82,9 +84,10 @@ def test_one_training_update(tmp_path: Path):
         action = agent.select_action(env, explore=True)
         sa = agent.features_for_action(env, action)
         _, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        agent.observe(sa, float(reward), env, done)
-        if done:
+        agent.observe(
+            sa, float(reward), env, terminated=bool(terminated), truncated=bool(truncated)
+        )
+        if terminated or truncated:
             env.reset()
 
     assert len(agent.buffer) >= cfg.batch_size
