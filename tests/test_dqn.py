@@ -20,6 +20,40 @@ def test_qnetwork_forward_pass():
     assert out.shape == (5,)
 
 
+def test_qnetwork_layer_norm_forward():
+    dim = state_action_feature_size()
+    net = QNetwork(dim, hidden_sizes=(64, 32), use_layer_norm=True)
+    x = torch.randn(5, dim)
+    out = net(x)
+    assert out.shape == (5,)
+
+
+def test_double_dqn_train_step():
+    cfg = DQNConfig(
+        device="cpu",
+        seed=7,
+        batch_size=8,
+        min_buffer_size=8,
+        buffer_size=1000,
+        double_dqn=True,
+        use_layer_norm=True,
+    )
+    agent = DQNAgent(cfg)
+    env = TetrisEnv(seed=7)
+    env.reset(seed=7)
+    for _ in range(20):
+        if env.engine.game_over or not env.legal_placements():
+            env.reset()
+        action = agent.select_action(env, explore=True)
+        sa = agent.features_for_action(env, action)
+        _, reward, terminated, truncated, _ = env.step(action)
+        agent.observe(sa, float(reward), env, terminated or truncated)
+        if terminated or truncated:
+            env.reset()
+    loss = agent.train_step()
+    assert loss is not None and np.isfinite(loss)
+
+
 def test_dqn_select_action():
     agent = DQNAgent(DQNConfig(device="cpu", seed=0, epsilon_start=0.0))
     env = TetrisEnv(seed=0)

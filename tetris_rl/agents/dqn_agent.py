@@ -48,15 +48,65 @@ class DQNConfig:
     hidden_sizes: tuple[int, ...] = (256, 256, 128)
     grad_clip: float = 10.0
     double_dqn: bool = False
+    use_layer_norm: bool = False
     device: str = "cpu"
     seed: Optional[int] = None
+
+
+def original_dqn_config(**overrides: Any) -> DQNConfig:
+    """Pre-audit defaults (config A)."""
+    cfg = DQNConfig(
+        lr=1e-3,
+        double_dqn=False,
+        epsilon_decay_steps=20_000,
+        target_update_freq=500,
+        grad_clip=10.0,
+        use_layer_norm=False,
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
+
+
+def improved_dqn_config(**overrides: Any) -> DQNConfig:
+    """
+    Post-audit defaults (config B): Double DQN, moderate LR, delta-friendly
+    exploration horizon, more frequent target sync, input LayerNorm.
+
+    Note: epsilon_decay_steps=15_000 reaches ε≈0.05 by ~15k env steps so that
+    short equal-budget runs (e.g. 400 episodes) still leave time for greedy
+    learning. Increase for multi-thousand-episode training.
+    """
+    cfg = DQNConfig(
+        lr=5e-4,
+        double_dqn=True,
+        epsilon_start=1.0,
+        epsilon_end=0.05,
+        epsilon_decay_steps=15_000,
+        target_update_freq=250,
+        grad_clip=5.0,
+        use_layer_norm=True,
+        batch_size=64,
+        buffer_size=50_000,
+        min_buffer_size=1_000,
+    )
+    for k, v in overrides.items():
+        setattr(cfg, k, v)
+    return cfg
 
 
 class QNetwork(nn.Module):
     """MLP scoring a single state-action feature vector → Q-value."""
 
-    def __init__(self, input_dim: int, hidden_sizes: tuple[int, ...] = (256, 256, 128)) -> None:
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_sizes: tuple[int, ...] = (256, 256, 128),
+        use_layer_norm: bool = False,
+    ) -> None:
         super().__init__()
+        self.use_layer_norm = use_layer_norm
+        self.input_norm = nn.LayerNorm(input_dim) if use_layer_norm else nn.Identity()
         layers: list[nn.Module] = []
         prev = input_dim
         for h in hidden_sizes:
@@ -68,7 +118,7 @@ class QNetwork(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Return Q-values with shape (batch,) from features (batch, F)."""
-        return self.net(x).squeeze(-1)
+        return self.net(self.input_norm(x)).squeeze(-1)
 
 
 class DQNAgent:
@@ -82,8 +132,16 @@ class DQNAgent:
             np.random.seed(self.config.seed)
 
         self.feature_dim = state_action_feature_size()
-        self.online = QNetwork(self.feature_dim, self.config.hidden_sizes).to(self.device)
-        self.target = QNetwork(self.feature_dim, self.config.hidden_sizes).to(self.device)
+        self.online = QNetwork(
+            self.feature_dim,
+            self.config.hidden_sizes,
+            use_layer_norm=self.config.use_layer_norm,
+        ).to(self.device)
+        self.target = QNetwork(
+            self.feature_dim,
+            self.config.hidden_sizes,
+            use_layer_norm=self.config.use_layer_norm,
+        ).to(self.device)
         self.target.load_state_dict(self.online.state_dict())
         self.target.eval()
 

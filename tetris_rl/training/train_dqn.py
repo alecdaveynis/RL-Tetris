@@ -16,9 +16,14 @@ from typing import Optional
 
 import numpy as np
 
-from tetris_rl.agents.dqn_agent import DQNAgent, DQNConfig
+from tetris_rl.agents.dqn_agent import (
+    DQNAgent,
+    DQNConfig,
+    improved_dqn_config,
+    original_dqn_config,
+)
 from tetris_rl.environment import TetrisEnv
-from tetris_rl.rewards import RewardConfig
+from tetris_rl.rewards import LegacyRewardConfig, RewardConfig
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -26,17 +31,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--episodes", type=int, default=5000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default=None, help="cpu | cuda | mps (auto if omitted)")
-    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument(
+        "--preset",
+        type=str,
+        default="improved",
+        choices=["original", "improved"],
+        help="original = pre-audit hparams+rewards; improved = post-audit defaults",
+    )
+    p.add_argument("--lr", type=float, default=None)
     p.add_argument("--gamma", type=float, default=0.99)
-    p.add_argument("--batch-size", type=int, default=64)
-    p.add_argument("--buffer-size", type=int, default=50_000)
-    p.add_argument("--min-buffer-size", type=int, default=1_000)
-    p.add_argument("--target-update-freq", type=int, default=500)
-    p.add_argument("--epsilon-start", type=float, default=1.0)
-    p.add_argument("--epsilon-end", type=float, default=0.05)
-    p.add_argument("--epsilon-decay-steps", type=int, default=20_000)
-    p.add_argument("--grad-clip", type=float, default=10.0)
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--buffer-size", type=int, default=None)
+    p.add_argument("--min-buffer-size", type=int, default=None)
+    p.add_argument("--target-update-freq", type=int, default=None)
+    p.add_argument("--epsilon-start", type=float, default=None)
+    p.add_argument("--epsilon-end", type=float, default=None)
+    p.add_argument("--epsilon-decay-steps", type=int, default=None)
+    p.add_argument("--grad-clip", type=float, default=None)
     p.add_argument("--double-dqn", action="store_true")
+    p.add_argument("--no-double-dqn", action="store_true")
     p.add_argument("--train-freq", type=int, default=1, help="Gradient steps per env step")
     p.add_argument("--eval-every", type=int, default=100, help="Episodes between greedy evals")
     p.add_argument("--eval-games", type=int, default=10)
@@ -48,6 +61,38 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
     p.add_argument("--no-tb", action="store_true", help="Disable TensorBoard (default on)")
     return p.parse_args(argv)
+
+
+def build_config(args: argparse.Namespace, device: str) -> tuple[DQNConfig, RewardConfig]:
+    """Build DQN + reward configs from --preset and CLI overrides."""
+    factory = original_dqn_config if args.preset == "original" else improved_dqn_config
+    overrides: dict = {"gamma": args.gamma, "device": device, "seed": args.seed}
+    for key in (
+        "lr",
+        "batch_size",
+        "buffer_size",
+        "min_buffer_size",
+        "target_update_freq",
+        "epsilon_start",
+        "epsilon_end",
+        "epsilon_decay_steps",
+        "grad_clip",
+    ):
+        val = getattr(args, key, None)
+        if val is not None:
+            overrides[key] = val
+
+    cfg = factory(**overrides)
+    if args.double_dqn:
+        cfg.double_dqn = True
+    if args.no_double_dqn:
+        cfg.double_dqn = False
+
+    if args.preset == "original":
+        reward_cfg: RewardConfig = LegacyRewardConfig()
+    else:
+        reward_cfg = RewardConfig()
+    return cfg, reward_cfg
 
 
 def resolve_device(requested: Optional[str]) -> str:
@@ -95,20 +140,10 @@ def train(args: argparse.Namespace) -> Path:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    cfg = DQNConfig(
-        gamma=args.gamma,
-        lr=args.lr,
-        batch_size=args.batch_size,
-        buffer_size=args.buffer_size,
-        min_buffer_size=args.min_buffer_size,
-        target_update_freq=args.target_update_freq,
-        epsilon_start=args.epsilon_start,
-        epsilon_end=args.epsilon_end,
-        epsilon_decay_steps=args.epsilon_decay_steps,
-        grad_clip=args.grad_clip,
-        double_dqn=args.double_dqn,
-        device=device,
-        seed=args.seed,
+    cfg, reward_cfg = build_config(args, device)
+    print(
+        f"preset={args.preset} device={device} lr={cfg.lr} double_dqn={cfg.double_dqn} "
+        f"eps_decay={cfg.epsilon_decay_steps} layer_norm={cfg.use_layer_norm}"
     )
 
     if args.resume:
@@ -148,7 +183,9 @@ def train(args: argparse.Namespace) -> Path:
         csv_writer.writeheader()
 
     meta = {
+        "preset": args.preset,
         "config": cfg.__dict__,
+        "reward_config": reward_cfg.__dict__,
         "episodes": args.episodes,
         "seed": args.seed,
         "device": device,
@@ -161,7 +198,7 @@ def train(args: argparse.Namespace) -> Path:
     t0 = time.time()
 
     for ep in range(1, args.episodes + 1):
-        env = TetrisEnv(seed=args.seed + ep, reward_config=RewardConfig())
+        env = TetrisEnv(seed=args.seed + ep, reward_config=reward_cfg)
         obs, info = env.reset(seed=args.seed + ep)
         ep_reward = 0.0
         losses: list[float] = []

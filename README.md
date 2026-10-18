@@ -1,6 +1,6 @@
 # Tetris-RL
 
-Deep reinforcement learning for Tetris — Cornell CS 4701 AI Practicum.
+Deep reinforcement learning for Tetris 
 
 A self-contained Python project that implements a Tetris game engine, a Gymnasium placement-level environment, heuristic and random baselines, and a custom PyTorch Deep Q-Network that learns to choose piece placements. Includes reproducible training, evaluation, comparison charts, and a Pygame UI for human play and AI demos.
 
@@ -100,76 +100,70 @@ python -m tetris_rl.ui.pygame_app --mode human
 
 ## How to train
 
-```bash
-export PYTHONPATH=.
-python -m tetris_rl.training.train_dqn --episodes 5000 --seed 42
-```
+Two presets:
 
-Useful flags:
-
-```bash
-python -m tetris_rl.training.train_dqn \
-  --episodes 5000 \
-  --seed 42 \
-  --device cpu \
-  --lr 1e-3 \
-  --double-dqn \
-  --checkpoint-dir models \
-  --log-dir results/train_logs \
-  --resume models/dqn_latest.pt
-```
-
-- Checkpoints: `models/dqn_latest.pt`, `models/dqn_best.pt`, `models/dqn_final.pt`
-- CSV metrics: `results/train_logs/training_metrics.csv`
-- TensorBoard: `tensorboard --logdir results/train_logs/tb`
-
-Smoke test (short run):
+| Preset | Meaning |
+|--------|---------|
+| `improved` (default) | Double DQN, LayerNorm, lr=`5e-4`, ε-decay 15k steps, **delta-based** rewards |
+| `original` | Pre-audit ablation: vanilla DQN, lr=`1e-3`, absolute-height reward shaping |
 
 ```bash
-bash scripts/run_smoke_train.sh
+# Recommended
+python -m tetris_rl.training.train_dqn --preset improved --episodes 5000 --seed 42
+
+# Ablation (legacy shaping + hparams)
+python -m tetris_rl.training.train_dqn --preset original --episodes 400 --seed 42 \
+  --checkpoint-dir models/original --log-dir results/train_original
 ```
+
+Useful flags: `--device cpu|mps|cuda`, `--resume PATH`, `--double-dqn` / `--no-double-dqn`, `--no-tb`.
+
+- Checkpoints: `models/*/dqn_best.pt`, `dqn_latest.pt`, `dqn_final.pt`
+- Equal-budget A/B script: `bash scripts/run_ab_experiment.sh 400`
 
 ## How to evaluate all agents
 
 ```bash
-export PYTHONPATH=.
-
-# Single agent
+# Single agent (greedy / no exploration)
 python -m tetris_rl.evaluation.evaluate --agent random --games 100 --seed 0
 python -m tetris_rl.evaluation.evaluate --agent heuristic --games 100 --seed 0
-python -m tetris_rl.evaluation.evaluate --agent dqn --model models/dqn_best.pt --games 100 --seed 0
+python -m tetris_rl.evaluation.evaluate --agent dqn --model models/improved/dqn_best.pt --games 100 --seed 0
 
-# Compare on the same seeded set (≥100 games)
-python -m tetris_rl.evaluation.compare --games 100 --seed 0 --model models/dqn_best.pt
+# Full A/B: random + heuristic + original DQN + improved DQN
+python -m tetris_rl.evaluation.compare_ab --games 100 --seed 0 \
+  --original-model models/original/dqn_best.pt \
+  --improved-model models/improved/dqn_best.pt \
+  --out-dir results/ab_comparison
 ```
 
-Outputs under `results/comparison/`: summary CSV/JSON, per-game CSVs, and charts (`mean_scores.png`, `score_boxplot.png`, `mean_lines.png`).
+Outputs: summary CSV/JSON, per-game CSVs, charts (`mean_scores.png`, `score_boxplot.png`, `mean_lines.png`).
 
-Reported metrics: mean/median/std score, mean/median lines, average pieces placed, best score, survival length, top-out rate.
+Eval metrics use **game score / lines cleared** (not shaped training reward). Policies run with ε=0.
 
 ## How to launch the AI demo
 
 ```bash
-export PYTHONPATH=.
+python -m tetris_rl.ui.pygame_app --mode human
 python -m tetris_rl.ui.pygame_app --mode heuristic
-python -m tetris_rl.ui.pygame_app --mode dqn --model models/dqn_best.pt
+python -m tetris_rl.ui.pygame_app --mode dqn --model models/improved/dqn_best.pt
 ```
 
 ## RL design
 
-### DQN
+### DQN (algorithms implemented)
 
-Placement-action value learning:
+Placement-action value learning (custom PyTorch; not SB3 DQN):
 
 1. Enumerate legal hard-drop placements.
 2. Compute state-action features φ(s, a) for each (resulting board + piece info).
-3. Q-network: Q(s, a) = f_θ(φ(s, a)).
+3. Q-network MLP: Q(s, a) = f_θ(φ(s, a)) (optional input LayerNorm in `improved`).
 4. ε-greedy selection during training; greedy at eval.
-5. Store transitions in a replay buffer.
-6. Train with Huber (Smooth L1) loss, gradient clipping, target network.
-7. Bootstrap with max Q over legal actions in the next state (optional Double DQN).
+5. Experience replay + Huber (Smooth L1) loss + gradient clipping + hard target sync.
+6. Bootstrap: max over legal next actions; **Double DQN** on by default in `improved`
+   (online argmax, target evaluation).
+7. Terminal → bootstrap target 0.
 
-Terminal states target Q = 0 (no bootstrap).
+Audit notes (`results/AUDIT.md`): Bellman/next-action handling were already correct; main learning bugs were reward shaping (absolute height tax) and terminal survival bonus on no-move game-overs.
 
 ### State representation
 
@@ -190,49 +184,57 @@ Variable legal placements each turn, encoded as indices `0 .. n_legal-1` with a 
 
 ### Reward function (training)
 
-Configurable shaping in `tetris_rl/rewards.py`:
+**Improved (default):** delta-based board terms — changes in holes / aggregate height / bumpiness, plus line-clear bonuses, survival bonus, and a large game-over penalty. Filling holes and lowering the stack are rewarded.
 
-- Positive reward for 1–4 line clears (larger for Tetrises)
-- Penalty for creating holes
-- Small penalties for stack height and bumpiness
-- Large penalty for game over
-- Optional small survival bonus
+**Original (ablation):** absolute aggregate-height penalty every step (dominates returns; kept for comparison only).
 
-**Training reward ≠ evaluation metrics.** Shaped reward guides learning; published comparisons use **game score** and **lines cleared** from the engine.
+**Training reward ≠ evaluation metrics.** Published tables use engine **score** and **lines cleared**.
 
 ## Testing
 
 ```bash
-export PYTHONPATH=.
 pytest -q
 ```
 
-Coverage includes rotations, placements, collisions, line clears, game over, reproducibility, observations, legal actions, rewards, DQN forward/update, and checkpoint save/load.
+Coverage includes engine, env, rewards (including audit fixes), DQN forward/Double-DQN update, and checkpoint save/load.
 
-## Example measured results (executed locally)
+## Measured results (executed locally)
 
-These numbers come from a real 100-game comparison (`--seed 0`, `--max-pieces 500`) after training DQN for **500 episodes** (not the full 5000). Re-run evaluation after longer training for updated figures.
+### A/B comparison — 100 shared seeded games
 
-| Agent | Mean score | Median score | Mean lines | Mean pieces | Top-out rate |
-|-------|------------|--------------|------------|-------------|--------------|
-| Random | 8.0 | 0.0 | 0.08 | 25.7 | 1.00 |
-| Heuristic | 21153.0 | 21300.0 | 194.0 | 496.4 | 0.02 |
-| DQN (500 eps) | 751.0 | 650.0 | 7.3 | 52.8 | 1.00 |
+Protocol: `--seed 0`, `--max-pieces 500`, ε=0 for DQN agents.
 
-Notes:
-- Heuristic rarely tops out within 500 pieces, so its score is largely “score accumulated before the piece cap.”
-- DQN beats random after short training but remains well below the strong hand-crafted heuristic; longer training (`--episodes 5000`) is expected to close some of the gap.
-- Artifacts: `results/comparison/comparison_summary.csv`, `mean_scores.png`, `score_boxplot.png`, `mean_lines.png`.
+| Agent | Mean score | Median | Best | Mean lines | Mean pieces | Std score |
+|-------|------------|--------|------|------------|-------------|-----------|
+| Random | 8.0 | 0 | 100 | 0.08 | 25.7 | 27.3 |
+| Heuristic | 21153.0 | 21300 | 22800 | 194.0 | 496.4 | 1413.8 |
+| DQN original | 566.0 | 500 | 2300 | 5.46 | 48.5 | 405.1 |
+| DQN improved | **939.0** | **900** | **2400** | **9.08** | **59.9** | 500.1 |
 
-## Limitations and future work
+**Training budgets (verified):**
+- **Original:** `--preset original`, 400 episodes, seed 42, max 200 pieces/ep → `models/original/dqn_best.pt`
+- **Improved:** `--preset improved`, continued training to ε=0.05 (~19k env steps) → `models/improved/dqn_best.pt`
 
-- No HOLD / wall kicks / full SRS / T-spins / combo scoring modes
-- Placement actions only (no DAS / soft-drop timing)
-- Vanilla / Double DQN; PPO or distributional RL could improve sample efficiency
-- Heuristic weights are hand-tuned, not optimized
-- Longer training and hyperparameter sweeps recommended for stronger play
-- Evaluation uses a `--max-pieces` safety cap (default 500)
+**Findings (measured, not claimed beyond this):**
+- Improved DQN beats original DQN and random on this protocol.
+- Neither DQN approaches the heuristic within this budget; heuristic rarely tops out before the 500-piece cap.
+- Artifacts: `results/ab_comparison/` (CSV/JSON + charts). Code audit: `results/AUDIT.md`.
 
-## License
+### Reproduce
 
-Course project code — use and modify freely for educational purposes.
+```bash
+bash scripts/run_ab_experiment.sh 400   # train both presets + compare
+# or evaluate existing checkpoints:
+python -m tetris_rl.evaluation.compare_ab --games 100 --seed 0 \
+  --original-model models/original/dqn_best.pt \
+  --improved-model models/improved/dqn_best.pt
+```
+
+## Limitations and next steps
+
+- No HOLD / full SRS / T-spins / combo scoring
+- Placement actions only
+- Heuristic still much stronger; try longer `--episodes 5000`, prioritized replay, or PPO
+- Resume training does not restore the replay buffer
+- Eval `--max-pieces` cap inflates heuristic “survival” vs natural top-out
+

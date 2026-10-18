@@ -72,10 +72,10 @@ def test_reward_hole_penalty():
     env = TetrisEnv(seed=0)
     before = np.zeros_like(env.engine.board)
     after = before.copy()
-    after[-1, 0] = 1
-    after[-2, 0] = 0
-    after[-3, 0] = 1  # hole at -2
-    # count_holes: empty with filled above
+    after[-3, 0] = 1
+    after[-2, 0] = 0  # hole
+    after[-1, 0] = 0
+    # Creating a hole (and adding height) should reduce reward vs empty→empty.
     r = shaped_reward(
         env.engine,
         before,

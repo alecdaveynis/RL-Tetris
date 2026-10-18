@@ -102,22 +102,23 @@ class TetrisEnv(gym.Env):
         self._last_lines = result.lines_cleared
         self._episode_steps += 1
 
+        # Resolve terminal *before* shaping so survival is not added on game-over
+        # from "no legal placements after piece advance".
+        if result.game_over:
+            self._legal = []
+        else:
+            self._refresh_legal()
+            if not self._legal:
+                self.engine.game_over = True
+
         reward = shaped_reward(
             self.engine,
             board_before,
             board_after,
             result.lines_cleared,
-            result.game_over,
+            self.engine.game_over,
             config=self.reward_config,
         )
-
-        if not result.game_over:
-            self._refresh_legal()
-            if not self._legal:
-                self.engine.game_over = True
-                reward -= self.reward_config.game_over_penalty
-        else:
-            self._legal = []
 
         terminated = self.engine.game_over
         truncated = False
