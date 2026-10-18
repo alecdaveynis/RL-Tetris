@@ -1,0 +1,252 @@
+"""
+CLI entry point for training the placement-action DQN.
+
+Example:
+    python -m tetris_rl.training.train_dqn --episodes 5000 --seed 42
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import time
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+from tetris_rl.agents.dqn_agent import DQNAgent, DQNConfig
+from tetris_rl.environment import TetrisEnv
+from tetris_rl.rewards import RewardConfig
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train Tetris placement-action DQN")
+    p.add_argument("--episodes", type=int, default=5000)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--device", type=str, default=None, help="cpu | cuda | mps (auto if omitted)")
+    p.add_argument("--lr", type=float, default=1e-3)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--buffer-size", type=int, default=50_000)
+    p.add_argument("--min-buffer-size", type=int, default=1_000)
+    p.add_argument("--target-update-freq", type=int, default=500)
+    p.add_argument("--epsilon-start", type=float, default=1.0)
+    p.add_argument("--epsilon-end", type=float, default=0.05)
+    p.add_argument("--epsilon-decay-steps", type=int, default=20_000)
+    p.add_argument("--grad-clip", type=float, default=10.0)
+    p.add_argument("--double-dqn", action="store_true")
+    p.add_argument("--train-freq", type=int, default=1, help="Gradient steps per env step")
+    p.add_argument("--eval-every", type=int, default=100, help="Episodes between greedy evals")
+    p.add_argument("--eval-games", type=int, default=10)
+    p.add_argument("--max-pieces", type=int, default=500, help="Safety cap per episode")
+    p.add_argument("--checkpoint-dir", type=str, default="models")
+    p.add_argument("--log-dir", type=str, default="results/train_logs")
+    p.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
+    p.add_argument("--save-every", type=int, default=100)
+    p.add_argument("--tb", action="store_true", help="Enable TensorBoard logging")
+    p.add_argument("--no-tb", action="store_true", help="Disable TensorBoard (default on)")
+    return p.parse_args(argv)
+
+
+def resolve_device(requested: Optional[str]) -> str:
+    import torch
+
+    if requested:
+        return requested
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def evaluate_greedy(agent: DQNAgent, n_games: int, seed: int, max_pieces: int) -> dict:
+    """Run greedy (ε=0) evaluation games; report score/lines metrics."""
+    old_eps = agent.epsilon
+    agent.epsilon = 0.0
+    scores, lines, pieces = [], [], []
+    for i in range(n_games):
+        env = TetrisEnv(seed=seed + 10_000 + i)
+        obs, info = env.reset(seed=seed + 10_000 + i)
+        done = False
+        while not done and env.engine.pieces_placed < max_pieces:
+            if info["n_legal"] == 0:
+                break
+            action = agent.select_action(env, explore=False)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        scores.append(env.engine.score)
+        lines.append(env.engine.lines_cleared_total)
+        pieces.append(env.engine.pieces_placed)
+    agent.epsilon = old_eps
+    return {
+        "mean_score": float(np.mean(scores)),
+        "mean_lines": float(np.mean(lines)),
+        "mean_pieces": float(np.mean(pieces)),
+    }
+
+
+def train(args: argparse.Namespace) -> Path:
+    device = resolve_device(args.device)
+    checkpoint_dir = Path(args.checkpoint_dir)
+    log_dir = Path(args.log_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = DQNConfig(
+        gamma=args.gamma,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        buffer_size=args.buffer_size,
+        min_buffer_size=args.min_buffer_size,
+        target_update_freq=args.target_update_freq,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
+        epsilon_decay_steps=args.epsilon_decay_steps,
+        grad_clip=args.grad_clip,
+        double_dqn=args.double_dqn,
+        device=device,
+        seed=args.seed,
+    )
+
+    if args.resume:
+        agent = DQNAgent.from_checkpoint(args.resume, device=device, explore=True)
+        # Keep training epsilon schedule from checkpoint state
+        print(f"Resumed from {args.resume} (steps={agent.total_steps}, eps={agent.epsilon:.3f})")
+    else:
+        agent = DQNAgent(cfg)
+
+    use_tb = args.tb or not args.no_tb
+    writer = None
+    if use_tb:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            writer = SummaryWriter(log_dir=str(log_dir / "tb"))
+        except Exception as exc:  # pragma: no cover
+            print(f"TensorBoard unavailable ({exc}); continuing without it.")
+
+    csv_path = log_dir / "training_metrics.csv"
+    write_header = not csv_path.exists()
+    csv_file = csv_path.open("a", newline="")
+    csv_writer = csv.DictWriter(
+        csv_file,
+        fieldnames=[
+            "episode",
+            "score",
+            "lines",
+            "pieces",
+            "reward",
+            "epsilon",
+            "loss",
+            "steps",
+        ],
+    )
+    if write_header:
+        csv_writer.writeheader()
+
+    meta = {
+        "config": cfg.__dict__,
+        "episodes": args.episodes,
+        "seed": args.seed,
+        "device": device,
+    }
+    (log_dir / "run_config.json").write_text(json.dumps(meta, indent=2, default=str))
+
+    best_eval = -float("inf")
+    global_loss_sum = 0.0
+    global_loss_count = 0
+    t0 = time.time()
+
+    for ep in range(1, args.episodes + 1):
+        env = TetrisEnv(seed=args.seed + ep, reward_config=RewardConfig())
+        obs, info = env.reset(seed=args.seed + ep)
+        ep_reward = 0.0
+        losses: list[float] = []
+        done = False
+
+        while not done and env.engine.pieces_placed < args.max_pieces:
+            if info["n_legal"] == 0:
+                break
+            action = agent.select_action(env, explore=True)
+            sa_feats = agent.features_for_action(env, action)
+            obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+            agent.observe(sa_feats, float(reward), env, done)
+            ep_reward += float(reward)
+
+            for _ in range(args.train_freq):
+                if len(agent.buffer) >= cfg.min_buffer_size:
+                    loss = agent.train_step()
+                    if loss is not None:
+                        losses.append(loss)
+                        global_loss_sum += loss
+                        global_loss_count += 1
+
+        mean_loss = float(np.mean(losses)) if losses else float("nan")
+        row = {
+            "episode": ep,
+            "score": env.engine.score,
+            "lines": env.engine.lines_cleared_total,
+            "pieces": env.engine.pieces_placed,
+            "reward": ep_reward,
+            "epsilon": agent.epsilon,
+            "loss": mean_loss,
+            "steps": agent.total_steps,
+        }
+        csv_writer.writerow(row)
+        csv_file.flush()
+
+        if writer is not None:
+            writer.add_scalar("train/score", row["score"], ep)
+            writer.add_scalar("train/lines", row["lines"], ep)
+            writer.add_scalar("train/episode_reward", ep_reward, ep)
+            writer.add_scalar("train/epsilon", agent.epsilon, ep)
+            if losses:
+                writer.add_scalar("train/loss", mean_loss, ep)
+
+        if ep % 10 == 0 or ep == 1:
+            elapsed = time.time() - t0
+            print(
+                f"ep={ep:5d} score={row['score']:5d} lines={row['lines']:3d} "
+                f"pieces={row['pieces']:3d} R={ep_reward:7.2f} eps={agent.epsilon:.3f} "
+                f"loss={mean_loss:.4f} steps={agent.total_steps} ({elapsed:.1f}s)"
+            )
+
+        if ep % args.save_every == 0:
+            ckpt = checkpoint_dir / f"dqn_ep{ep}.pt"
+            agent.save(ckpt)
+            agent.save(checkpoint_dir / "dqn_latest.pt")
+
+        if args.eval_every > 0 and ep % args.eval_every == 0:
+            metrics = evaluate_greedy(agent, args.eval_games, args.seed, args.max_pieces)
+            print(
+                f"  [eval] mean_score={metrics['mean_score']:.1f} "
+                f"mean_lines={metrics['mean_lines']:.2f} "
+                f"mean_pieces={metrics['mean_pieces']:.1f}"
+            )
+            if writer is not None:
+                writer.add_scalar("eval/mean_score", metrics["mean_score"], ep)
+                writer.add_scalar("eval/mean_lines", metrics["mean_lines"], ep)
+            if metrics["mean_score"] >= best_eval:
+                best_eval = metrics["mean_score"]
+                agent.save(checkpoint_dir / "dqn_best.pt")
+
+    agent.save(checkpoint_dir / "dqn_final.pt")
+    agent.save(checkpoint_dir / "dqn_latest.pt")
+    csv_file.close()
+    if writer is not None:
+        writer.close()
+    print(f"Training complete. Checkpoints in {checkpoint_dir}")
+    return checkpoint_dir / "dqn_final.pt"
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = parse_args(argv)
+    train(args)
+
+
+if __name__ == "__main__":
+    main()

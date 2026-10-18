@@ -1,0 +1,10 @@
+numpy>=1.24
+torch>=2.0
+gymnasium>=0.29
+stable-baselines3>=2.0
+# pygame-ce is API-compatible with pygame and ships wheels for newer Python
+# (including 3.14). On Python 3.11–3.12 you may use `pygame>=2.5` instead.
+pygame-ce>=2.5
+tensorboard>=2.14
+matplotlib>=3.7
+pytest>=7.4

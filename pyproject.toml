@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tetris-rl"
+version = "1.0.0"
+description = "Deep reinforcement learning for Tetris (Cornell CS 4701)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24",
+  "torch>=2.0",
+  "gymnasium>=0.29",
+  "stable-baselines3>=2.0",
+  "pygame-ce>=2.5",
+  "tensorboard>=2.14",
+  "matplotlib>=3.7",
+  "pytest>=7.4",
+]
+
+[project.scripts]
+tetris-rl-train = "tetris_rl.training.train_dqn:main"
+tetris-rl-eval = "tetris_rl.evaluation.evaluate:main"
+tetris-rl-compare = "tetris_rl.evaluation.compare:main"
+tetris-rl-ui = "tetris_rl.ui.pygame_app:main"
+
+[tool.setuptools.packages.find]
+include = ["tetris_rl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
