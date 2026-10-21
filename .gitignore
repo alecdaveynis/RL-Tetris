@@ -21,6 +21,10 @@ htmlcov/
 
 # Training artifacts (keep directory placeholders)
 models/*.pt
+# Experiment checkpoints (large; dqn_final.pt embeds the replay buffer, ~850 MB each)
+models/exp_*/
+models/backup_*/
+models/frozen/
 results/**
 !models/.gitkeep
 !results/.gitkeep

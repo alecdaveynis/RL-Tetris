@@ -6,7 +6,16 @@ import numpy as np
 
 from tetris_rl.environment import TetrisEnv
 from tetris_rl.features import board_metrics
-from tetris_rl.rewards import LegacyRewardConfig, RewardConfig, shaped_reward
+import pytest
+
+from tetris_rl.rewards import (
+    HeuristicAlignedRewardConfig,
+    LegacyRewardConfig,
+    RewardConfig,
+    reward_config_from_name,
+    shaped_reward,
+)
+from tetris_rl.training.train_dqn import build_config, parse_args
 
 
 def test_delta_height_does_not_punish_static_stack():
@@ -91,6 +100,47 @@ def test_legacy_absolute_height_still_available():
     assert r < 0  # absolute height penalty
 
 
+def test_heuristic_aligned_matches_heuristic_ranking():
+    """On a shared board, heuristic-aligned deltas rank placements like HeuristicAgent."""
+    from tetris_rl.agents.heuristic_agent import HeuristicAgent
+
+    env = TetrisEnv(seed=3)
+    env.reset(seed=3)
+    heur = HeuristicAgent(seed=0)
+    cfg = HeuristicAlignedRewardConfig(game_over_penalty=0.0, survival_reward=0.0)
+    before = env.engine.copy_board()
+    n = len(env.legal_placements())
+    h_scores = np.array([heur.evaluate_placement(env, i) for i in range(n)])
+    r_scores = []
+    for i, p in enumerate(env.legal_placements()):
+        after, lines, _ = env.engine.simulate_placement(p)
+        r_scores.append(
+            shaped_reward(env.engine, before, after, lines, game_over=False, config=cfg)
+        )
+    r_scores = np.array(r_scores)
+    # Ranking must match: delta(Φ) = Φ(after) - Φ(before) and Φ(before) is constant.
+    assert int(np.argmax(h_scores)) == int(np.argmax(r_scores))
+    # Constant offset: heuristic uses absolute Φ(after).
+    offset = h_scores - r_scores
+    assert np.allclose(offset, offset[0], atol=1e-5)
+
+
+def test_heuristic_aligned_penalizes_height_more_than_delta_default():
+    eng = TetrisEnv(seed=0).engine
+    before = np.zeros_like(eng.board)
+    after = before.copy()
+    after[-4:, 0] = 1  # raise one column by 4
+    r_delta = shaped_reward(
+        eng, before, after, 0, False,
+        RewardConfig(height_penalty=0.04, hole_penalty=0.0, bumpiness_penalty=0.0, survival_reward=0.0),
+    )
+    r_h = shaped_reward(
+        eng, before, after, 0, False,
+        HeuristicAlignedRewardConfig(survival_reward=0.0, game_over_penalty=0.0),
+    )
+    assert r_h < r_delta < 0
+
+
 def test_terminal_no_legal_moves_no_survival_bonus():
     """Game-over from no legal moves must not include survival_reward."""
     env = TetrisEnv(seed=0, reward_config=RewardConfig(survival_reward=0.01, game_over_penalty=10.0))
@@ -111,3 +161,54 @@ def test_terminal_no_legal_moves_no_survival_bonus():
     # Terminal reward should be <= -game_over_penalty + small board deltas
     # and must not be survival-only.
     assert last_reward < -1.0
+
+
+def test_reward_config_from_name():
+    assert type(reward_config_from_name("delta")).__name__ == "RewardConfig"
+    assert isinstance(reward_config_from_name("legacy"), LegacyRewardConfig)
+    assert isinstance(reward_config_from_name("heuristic_aligned"), HeuristicAlignedRewardConfig)
+    assert isinstance(reward_config_from_name("dellacherie"), HeuristicAlignedRewardConfig)
+    with pytest.raises(ValueError):
+        reward_config_from_name("not_a_mode")
+
+
+def test_train_cli_reward_mode_override():
+    args = parse_args(["--preset", "improved", "--reward-mode", "heuristic_aligned", "--seed", "1"])
+    cfg, reward_cfg = build_config(args, device="cpu")
+    assert cfg.double_dqn is True
+    assert isinstance(reward_cfg, HeuristicAlignedRewardConfig)
+    assert reward_cfg.height_penalty == pytest.approx(0.51)
+
+    args_delta = parse_args(["--preset", "improved", "--reward-mode", "delta"])
+    _, delta_cfg = build_config(args_delta, device="cpu")
+    assert type(delta_cfg) is RewardConfig
+    assert delta_cfg.height_penalty == pytest.approx(0.04)
+
+
+def test_heuristic_aligned_ranking_on_nonempty_board():
+    from tetris_rl.agents.heuristic_agent import HeuristicAgent
+    from tetris_rl.agents.random_agent import RandomAgent
+
+    env = TetrisEnv(seed=11)
+    env.reset(seed=11)
+    rand = RandomAgent(seed=11)
+    for _ in range(8):
+        if env.engine.game_over or not env.legal_placements():
+            break
+        env.step(rand.select_action(env))
+    if env.engine.game_over or len(env.legal_placements()) < 2:
+        pytest.skip("episode ended too early for ranking check")
+
+    heur = HeuristicAgent(seed=0)
+    cfg = HeuristicAlignedRewardConfig(game_over_penalty=0.0, survival_reward=0.0)
+    before = env.engine.copy_board()
+    h_scores = np.array([heur.evaluate_placement(env, i) for i in range(len(env.legal_placements()))])
+    r_scores = []
+    for p in env.legal_placements():
+        after, lines, _ = env.engine.simulate_placement(p)
+        r_scores.append(
+            shaped_reward(env.engine, before, after, lines, game_over=False, config=cfg)
+        )
+    r_scores = np.array(r_scores)
+    assert int(np.argmax(h_scores)) == int(np.argmax(r_scores))
+    assert np.allclose(h_scores - r_scores, (h_scores - r_scores)[0], atol=1e-5)

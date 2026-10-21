@@ -50,7 +50,38 @@ class LegacyRewardConfig(RewardConfig):
     use_positive_only_deltas: bool = True
 
 
+@dataclass
+class HeuristicAlignedRewardConfig(RewardConfig):
+    """
+    One-step Dellacherie weights used by HeuristicAgent, applied to *deltas*.
+
+    For a shared previous board, greedy ranking of
+        0.76*lines - 0.51*height_after - 0.36*holes_after - 0.18*bump_after
+    is identical to ranking the same linear combination of deltas.
+    Height is ~13× stronger than RewardConfig.height_penalty=0.04, matching
+    the working heuristic rather than the weak delta default.
+    """
+
+    line_clear: tuple[float, float, float, float] = (0.76, 1.52, 2.28, 3.04)
+    hole_penalty: float = 0.36
+    height_penalty: float = 0.51
+    bumpiness_penalty: float = 0.18
+    game_over_penalty: float = 10.0
+    survival_reward: float = 0.0
+
+
 DEFAULT_REWARD_CONFIG = RewardConfig()
+
+
+def reward_config_from_name(name: str) -> RewardConfig:
+    key = name.lower().replace("-", "_")
+    if key in ("delta", "improved", "default"):
+        return RewardConfig()
+    if key in ("legacy", "original"):
+        return LegacyRewardConfig()
+    if key in ("heuristic", "heuristic_aligned", "dellacherie"):
+        return HeuristicAlignedRewardConfig()
+    raise ValueError(f"Unknown reward config: {name}")
 
 
 def shaped_reward(

@@ -152,6 +152,9 @@ class DQNAgent:
         self.learn_steps = 0
         self.best_eval_score = -float("inf")
         self.episodes_trained = 0
+        self.last_train_stats: dict[str, float] = {}
+        self.imitation: Optional[Any] = None  # optional ImitationRegularizer
+        self.grad_diag_every = 50
 
     def name(self) -> str:
         return "dqn"
@@ -222,18 +225,50 @@ class DQNAgent:
     def features_for_action(self, env: TetrisEnv, action: int) -> np.ndarray:
         return state_action_features(env.engine, env.legal_placements()[action])
 
+    def attach_imitation(self, regularizer: Any, grad_diag_every: int = 50) -> None:
+        """
+        Attach a persistent expert-imitation regulariser (see training/imitation.py).
+        Total loss = TD + regularizer.weight * CE(demo batch). With weight 0 the CE
+        is only *logged* (no gradient), so the update is identical to plain DQN.
+        """
+        self.imitation = regularizer
+        self.grad_diag_every = int(grad_diag_every)
+
+    def load_init_weights(self, path: str | Path, load_optimizer: bool = True) -> None:
+        """
+        Initialise from a (behaviour-cloned) checkpoint: copies online / target
+        weights (and optionally Adam state) only. Counters, epsilon, replay buffer
+        and RNG state are NOT taken from the checkpoint -- this is a fresh RL run.
+        """
+        ckpt: dict[str, Any] = torch.load(path, map_location=self.device, weights_only=False)
+        self.online.load_state_dict(ckpt["online"])
+        self.target.load_state_dict(ckpt["target"])
+        if load_optimizer and ckpt.get("optimizer") is not None:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
+            for group in self.optimizer.param_groups:
+                group["lr"] = self.config.lr  # CLI/preset lr wins over the checkpoint's
+        self.epsilon = self.config.epsilon_start
+
     def train_step(self) -> Optional[float]:
-        """One gradient update. Returns loss, or None if buffer too small."""
+        """One gradient update. Returns the total loss, or None if buffer too small."""
         cfg = self.config
         if not self.buffer.can_sample(cfg.batch_size):
             return None
 
         batch = self.buffer.sample(cfg.batch_size)
-        loss = self._compute_loss(batch)
+        td_loss = self._compute_loss(batch)
+        loss = td_loss
+        reg = getattr(self, "imitation", None)
+        if reg is not None:
+            loss = self._add_imitation(td_loss, reg)
+        else:
+            self.last_train_stats["td_loss"] = float(td_loss.item())
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.online.parameters(), cfg.grad_clip)
+        # clip_grad_norm_ returns the pre-clip total norm (instrumentation only).
+        grad_norm = nn.utils.clip_grad_norm_(self.online.parameters(), cfg.grad_clip)
+        self.last_train_stats["grad_norm"] = float(grad_norm)
         self.optimizer.step()
 
         self.grad_steps += 1
@@ -242,6 +277,46 @@ class DQNAgent:
             self.target.load_state_dict(self.online.state_dict())
 
         return float(loss.item())
+
+    def _add_imitation(self, td_loss: torch.Tensor, reg: Any) -> torch.Tensor:
+        """
+        L_total = td_loss + weight * CE(Q_online over legal demo actions, expert action).
+        Gradient flows only through ``self.online``; expert labels are stored integers
+        and the target network is not used by the CE term.
+        """
+        from tetris_rl.training.imitation import flat_grad_norm, grad_cosine, imitation_ce
+
+        feats, mask, chosen = reg.sample()
+        diag = self.grad_diag_every > 0 and (self.grad_steps % self.grad_diag_every == 0)
+        w = reg.weight
+        st = self.last_train_stats
+        if w > 0 or diag:
+            ce, ce_stats = imitation_ce(self.online, feats, mask, chosen)
+        else:  # lambda = 0: log-only, no graph
+            with torch.no_grad():
+                ce, ce_stats = imitation_ce(self.online, feats, mask, chosen)
+        total = td_loss + w * ce if w > 0 else td_loss
+        st.update(
+            td_loss=float(td_loss.item()),
+            imit_loss=float(ce.item()),
+            imit_weighted=float(w * ce.item()),
+            total_loss=float(td_loss.item() + w * ce.item()),
+            imit_top1=ce_stats["top1"],
+            imit_margin=ce_stats["margin"],
+            imit_expert_prob=ce_stats["expert_prob"],
+        )
+        if diag:
+            # Instrumentation only: per-loss gradient norms (no .grad is written).
+            params = [p for p in self.online.parameters() if p.requires_grad]
+            g_td = torch.autograd.grad(td_loss, params, retain_graph=True, allow_unused=True)
+            g_im = torch.autograd.grad(ce, params, retain_graph=True, allow_unused=True)
+            st.update(
+                gn_td=flat_grad_norm(g_td),
+                gn_imit_unweighted=flat_grad_norm(g_im),
+                gn_imit_weighted=w * flat_grad_norm(g_im),
+                grad_cos_td_imit=grad_cosine(g_td, g_im),
+            )
+        return total
 
     def _pad_next_actions(
         self, batch: list[Transition]
@@ -346,9 +421,17 @@ class DQNAgent:
         q_sa = self.online(sa)
         with torch.no_grad():
             targets = self.bellman_targets(batch, vectorized=True)
+            td = q_sa.detach() - targets
+            self.last_train_stats = {
+                "q_mean": float(q_sa.detach().mean().item()),
+                "q_abs_mean": float(q_sa.detach().abs().mean().item()),
+                "td_error": float(td.abs().mean().item()),
+                "target_mean": float(targets.mean().item()),
+            }
         return F.smooth_l1_loss(q_sa, targets)
 
-    def save(self, path: str | Path) -> None:
+    def save(self, path: str | Path, include_buffer: bool = True) -> None:
+        """Save checkpoint. ``include_buffer=False`` writes a small weights/optimizer file."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload: dict[str, Any] = {
@@ -363,7 +446,7 @@ class DQNAgent:
             "learn_steps": self.learn_steps,
             "best_eval_score": self.best_eval_score,
             "episodes_trained": self.episodes_trained,
-            "buffer": self.buffer.state_dict(),
+            "buffer": self.buffer.state_dict() if include_buffer else None,
             "agent_rng_state": self.rng.bit_generator.state,
             "torch_rng_state": torch.get_rng_state(),
             "numpy_rng_state": np.random.get_state(),
@@ -394,21 +477,45 @@ class DQNAgent:
             self.buffer.load_state_dict(ckpt["buffer"])
 
         if "agent_rng_state" in ckpt and ckpt["agent_rng_state"] is not None:
-            self.rng.bit_generator.state = ckpt["agent_rng_state"]
+            try:
+                self.rng.bit_generator.state = ckpt["agent_rng_state"]
+            except Exception:
+                pass
 
-        if "torch_rng_state" in ckpt and ckpt["torch_rng_state"] is not None:
-            torch.set_rng_state(ckpt["torch_rng_state"])
+        # torch.load(map_location=mps/cuda) can move the CPU ByteTensor RNG
+        # state onto the accelerator; set_rng_state requires a CPU ByteTensor.
+        self._restore_torch_rng(ckpt.get("torch_rng_state"))
         if "numpy_rng_state" in ckpt and ckpt["numpy_rng_state"] is not None:
-            np.random.set_state(ckpt["numpy_rng_state"])
+            try:
+                np.random.set_state(ckpt["numpy_rng_state"])
+            except Exception:
+                pass
         if (
             self.device.type == "cuda"
             and "cuda_rng_state" in ckpt
             and ckpt["cuda_rng_state"] is not None
         ):
-            torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+            try:
+                torch.cuda.set_rng_state(ckpt["cuda_rng_state"])
+            except Exception:
+                pass
 
         self.online.to(self.device)
         self.target.to(self.device)
+
+    @staticmethod
+    def _restore_torch_rng(state: Any) -> None:
+        """Restore torch CPU RNG; ignore unusable states (e.g. MPS-mapped tensors)."""
+        if state is None:
+            return
+        try:
+            if isinstance(state, torch.Tensor):
+                state = state.detach().to("cpu").contiguous()
+                if state.dtype != torch.uint8:
+                    state = state.to(torch.uint8)
+            torch.set_rng_state(state)
+        except (TypeError, RuntimeError):
+            return
 
     @classmethod
     def from_checkpoint(

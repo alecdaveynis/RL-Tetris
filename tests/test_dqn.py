@@ -94,6 +94,10 @@ def test_one_training_update(tmp_path: Path):
     loss = agent.train_step()
     assert loss is not None
     assert np.isfinite(loss)
+    assert "q_mean" in agent.last_train_stats
+    assert "td_error" in agent.last_train_stats
+    assert np.isfinite(agent.last_train_stats["q_mean"])
+    assert agent.last_train_stats["td_error"] >= 0.0
 
 
 def test_model_save_load(tmp_path: Path):

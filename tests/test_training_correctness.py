@@ -180,6 +180,22 @@ def test_checkpoint_restores_buffer_rng_and_best_eval(tmp_path: Path):
     assert a1 == a2
 
 
+def test_load_survives_mps_mapped_torch_rng(tmp_path: Path):
+    """map_location=mps turns CPU ByteTensor RNG into a non-ByteTensor-on-CPU."""
+    cfg = DQNConfig(device="cpu", seed=4, hidden_sizes=(32, 16), buffer_size=50)
+    agent = DQNAgent(cfg)
+    path = tmp_path / "rng.pt"
+    agent.save(path)
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    # Simulate the failure mode: float tensor / wrong device-like object
+    fake = ckpt["torch_rng_state"].float()
+    ckpt["torch_rng_state"] = fake
+    bad = tmp_path / "bad_rng.pt"
+    torch.save(ckpt, bad)
+    loaded = DQNAgent.from_checkpoint(bad, device="cpu", explore=True)
+    assert loaded.total_steps == agent.total_steps
+
+
 def test_legacy_checkpoint_without_buffer_loads(tmp_path: Path):
     """Older checkpoints missing buffer/rng keys still load weights."""
     cfg = DQNConfig(device="cpu", seed=6, hidden_sizes=(32, 16))
