@@ -1,0 +1,706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tetris DQN Explorer</title>
+<style>
+  :root {
+    --bg:#0e121b; --panel:#161c2a; --panel2:#1c2436; --line:#2a3550; --text:#e7eaf3; --muted:#8c96b0;
+    --gold:#f5b301; --cyan:#35c2f0; --red:#b31b1b; --green:#3ddc97; --pink:#ff5d73; --blue:#4aa3ff; --orange:#ff8a3d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin:0; background:var(--bg); color:var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; }
+  header { border-top: 4px solid var(--red); padding: 10px 18px; display:flex; flex-wrap:wrap; gap:14px; align-items:center;
+    background: #111726; border-bottom:1px solid var(--line); }
+  header h1 { font-size:18px; margin:0; letter-spacing:.2px; }
+  header h1 small { color:var(--muted); font-weight:400; font-size:12px; margin-left:8px; }
+  .chip { background:var(--panel2); border:1px solid var(--line); border-radius:999px; padding:3px 10px; color:var(--muted); font-size:12px; }
+  .chip b { color:var(--text); font-weight:600; }
+  select, input, button { font: inherit; color: var(--text); background: var(--panel2); border:1px solid var(--line);
+    border-radius:6px; padding:5px 8px; }
+  button { cursor:pointer; } button:hover { border-color:#4a5a85; background:#222c44; }
+  button.primary { background:#26437a; border-color:#3b5fa8; } button.primary:hover { background:#2d519a; }
+  button.on { background:#7a2330; border-color:#b3394b; }
+  main { display:grid; grid-template-columns: 290px minmax(420px,1fr) 340px; gap:14px; padding:14px 18px; align-items:start; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:.8px; color:var(--muted); margin:0 0 8px; font-weight:700; }
+  .row { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  .row label { color:var(--muted); font-size:12px; }
+  .piecebtn { padding:2px; width:28px; height:30px; display:flex; align-items:center; justify-content:center; }
+  #curPick, #nextPick { gap:3px !important; flex-wrap:nowrap !important; }
+  .piecebtn.sel { border-color:var(--gold); background:#2b2a1c; }
+  .piecebtn.selnext { border-color:var(--cyan); background:#16303a; }
+  canvas { display:block; }
+  #boardCanvas { border:1px solid var(--line); border-radius:6px; background:#0b0e14; margin:auto; }
+  .legend { display:flex; gap:12px; flex-wrap:wrap; color:var(--muted); font-size:12px; margin-bottom:8px; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:2px; margin-right:4px; vertical-align:-1px; }
+  #grid { display:grid; grid-template-columns: repeat(auto-fill, minmax(104px,1fr)); gap:8px; max-height: 640px; overflow:auto; padding:2px; }
+  .cand { background:var(--panel2); border:2px solid transparent; border-radius:8px; padding:6px 4px 5px; text-align:center; cursor:pointer; position:relative; }
+  .cand:hover { border-color:#4a5a85; }
+  .cand.sel { border-color:#fff; }
+  .cand.dqn { box-shadow: 0 0 0 2px var(--gold) inset; }
+  .cand.heur { outline:2px dashed var(--cyan); outline-offset:-2px; }
+  .cand canvas { margin:0 auto 4px; }
+  .cand .q { font-weight:700; font-size:14px; }
+  .cand .sub { color:var(--muted); font-size:11px; }
+  .badge { position:absolute; top:3px; font-size:10px; font-weight:800; padding:1px 5px; border-radius:4px; color:#111; }
+  .badge.d { left:3px; background:var(--gold); } .badge.h { right:3px; background:var(--cyan); }
+  .badge.clr { right:3px; top:auto; bottom:42px; background:var(--green); }
+  table.cmp { width:100%; border-collapse:collapse; font-size:12px; }
+  table.cmp td, table.cmp th { padding:3px 4px; border-bottom:1px solid #222b40; text-align:right; }
+  table.cmp th { color:var(--muted); font-weight:600; } table.cmp td:first-child, table.cmp th:first-child { text-align:left; color:var(--muted); }
+  .verdict { padding:8px 10px; border-radius:8px; margin-bottom:10px; font-weight:600; }
+  .verdict.agree { background:#12301f; border:1px solid #1f6b3f; } .verdict.dis { background:#35201a; border:1px solid #8a4423; }
+  .cmpboards { display:flex; gap:10px; justify-content:space-around; margin-bottom:8px; }
+  .cmpboards div { text-align:center; font-size:12px; cursor:pointer; }
+  .muted { color:var(--muted); } .small { font-size:12px; } .err { color:var(--pink); }
+  #network { margin: 0 18px 24px; }
+  #netwrap { display:grid; grid-template-columns: 1fr 330px; gap:12px; }
+  #netCanvas { width:100%; height:580px; background:#0b0e14; border-radius:8px; border:1px solid var(--line); }
+  #netinfo { font-size:12px; max-height:580px; overflow:auto; }
+  #netinfo h3 { font-size:12px; margin:10px 0 4px; color:var(--muted); text-transform:uppercase; letter-spacing:.6px; }
+  #netinfo table { width:100%; border-collapse:collapse; } #netinfo td { padding:2px 3px; border-bottom:1px solid #222b40; }
+  #netinfo td:last-child { text-align:right; font-variant-numeric: tabular-nums; }
+  .pos { color:var(--green); } .neg { color:var(--pink); }
+  #qbars { width:100%; height:130px; background:#0b0e14; border-radius:6px; border:1px solid var(--line); margin-bottom:10px; }
+  .help { color:var(--muted); font-size:12px; margin-top:6px; }
+  details summary { cursor:pointer; color:var(--muted); }
+  @media (max-width:1250px) { main { grid-template-columns: 270px 1fr; } main > section:nth-child(3) { grid-column: 1 / -1; } #netwrap { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Tetris DQN Explorer <small>placement-action Q-network · Cornell CS 4701</small></h1>
+  <span><label class="muted">Checkpoint </label>
+    <select id="ckptSel" style="max-width:380px"></select></span>
+  <span class="chip" id="chipArch"></span>
+  <span class="chip" id="chipTrain"></span>
+</header>
+
+<main>
+  <!-- LEFT: state -->
+  <section class="card">
+    <h2>Board state</h2>
+    <canvas id="boardCanvas"></canvas>
+    <div class="help" id="boardNote"></div>
+    <div class="row"><label>Current</label><span id="curPick" class="row" style="margin:0"></span></div>
+    <div class="row"><label>Next&nbsp;&nbsp;&nbsp;&nbsp;</label><span id="nextPick" class="row" style="margin:0"></span></div>
+    <div class="row">
+      <button id="btnEdit">Edit board</button>
+      <button id="btnClear">Empty</button>
+    </div>
+    <h2 style="margin-top:12px">Generate a state</h2>
+    <div class="row">
+      <label>Play with</label>
+      <select id="genAgent"><option>heuristic</option><option>dqn</option><option>random</option></select>
+      <label>seed</label><input id="genSeed" type="number" value="7" style="width:62px">
+      <label>pieces</label><input id="genPieces" type="number" value="18" min="0" max="400" style="width:62px">
+    </div>
+    <div class="row">
+      <button id="btnGen" class="primary">Generate</button>
+      <button id="btnDis" class="primary" title="Roll the heuristic forward until the DQN would choose differently">Next DQN ≠ heuristic</button>
+    </div>
+    <h2 style="margin-top:12px">Advance the game</h2>
+    <div class="row">
+      <button id="btnPlaySel">Play selected</button>
+      <button id="btnPlayDqn">Play DQN</button>
+      <button id="btnPlayHeur">Play heuristic</button>
+    </div>
+    <div class="help" id="gameStats"></div>
+    <div class="help">After a move, the next preview piece is drawn at random from a fresh 7-bag.</div>
+  </section>
+
+  <!-- CENTER: placements -->
+  <section class="card">
+    <h2 id="candTitle">Legal placements</h2>
+    <div class="legend">
+      <span><i class="dot" style="background:var(--gold)"></i>DQN's choice (argmax Q)</span>
+      <span><i class="dot" style="background:var(--cyan)"></i>Heuristic's choice</span>
+      <span><i class="dot" style="background:#fff"></i>Selected</span>
+      <span class="small">Thumbnails show the board <b>after</b> the move (what the network sees).</span>
+    </div>
+    <canvas id="qbars"></canvas>
+    <div class="row">
+      <label>Sort by</label>
+      <select id="sortSel">
+        <option value="q">Q-value (high → low)</option>
+        <option value="h">Heuristic score (high → low)</option>
+        <option value="rc">Rotation, column</option>
+      </select>
+      <span class="help" style="margin:0">Click a placement (or ← / → keys) to select it; the network below shows its activations.</span>
+    </div>
+    <div id="grid"></div>
+  </section>
+
+  <!-- RIGHT: compare -->
+  <section class="card">
+    <h2>DQN vs. heuristic</h2>
+    <div id="cmp"></div>
+  </section>
+</main>
+
+<section id="network" class="card">
+  <h2 id="netTitle">Network</h2>
+  <div class="row">
+    <label>Strongest connections per layer</label>
+    <input id="edgeK" type="range" min="0" max="300" value="70" style="width:160px">
+    <span id="edgeKval" class="muted">70</span>
+    <span class="muted small">edge = weight × input activation: <b class="pos">green</b> pushes the next unit up, <b class="neg">red</b> pushes it down. Hover a unit for its inputs; click to pin.</span>
+  </div>
+  <div id="netwrap">
+    <canvas id="netCanvas"></canvas>
+    <div id="netinfo"></div>
+  </div>
+</section>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const PIECES = ['I','O','T','S','Z','J','L'];
+const COLORS = ['#0b0e14','#00dcdc','#dcc828','#b450c8','#50c850','#dc3c3c','#3c64dc','#e68c28','#7d8596','#ffffff'];
+const GROUP_COL = {board:'#4C78A8', current:'#F58518', next:'#E45756', heights:'#54A24B', scalars:'#9D6FB0'};
+const H=20, W=10;
+
+const S = {
+  info:null, weights:null, board:'0'.repeat(200), current:2, next:0, A:null, sel:0, hover:null, sort:'q',
+  edit:false, seq:0, pinned:null, hoverUnit:null, edgeK:70, pieces:0, score:0, lines:0, busy:false,
+};
+
+async function api(path, body) {
+  const r = await fetch(path, body === undefined ? {} :
+    {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j;
+}
+function b64f32(s) {
+  const bin = atob(s), u8 = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) u8[i] = bin.charCodeAt(i);
+  return new Float32Array(u8.buffer);
+}
+const fmt = (x, d=2) => (x>=0?'+':'') + x.toFixed(d);
+const fmtq = x => x.toFixed(2);
+
+// ---------------------------------------------------------------- board drawing
+function drawBoard(cv, boardStr, cell, o={}) {
+  const dpr = devicePixelRatio || 1;
+  const w = W*cell, h = H*cell;
+  cv.style.width = w+'px'; cv.style.height = h+'px';
+  cv.width = w*dpr; cv.height = h*dpr;
+  const c = cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0);
+  c.fillStyle = '#0b0e14'; c.fillRect(0,0,w,h);
+  const placed = new Set((o.placed||[]).map(p => p[0]*W+p[1]));
+  for (let r=0;r<H;r++) for (let col=0;col<W;col++) {
+    const v = +boardStr[r*W+col];
+    if (v) {
+      c.fillStyle = COLORS[v];
+      c.fillRect(col*cell+0.5, r*cell+0.5, cell-1, cell-1);
+      if (placed.has(r*W+col)) {
+        c.strokeStyle = '#fff'; c.lineWidth = Math.max(1, cell/9);
+        c.strokeRect(col*cell+1.2, r*cell+1.2, cell-2.4, cell-2.4);
+      } else if (o.dim) { c.fillStyle='rgba(11,14,20,.35)'; c.fillRect(col*cell+0.5, r*cell+0.5, cell-1, cell-1); }
+    } else if (cell >= 14) {
+      c.fillStyle = '#121826'; c.fillRect(col*cell+0.5, r*cell+0.5, cell-1, cell-1);
+    }
+  }
+  if (o.ghost) {
+    c.fillStyle = o.ghostColor || 'rgba(255,255,255,.35)';
+    for (const [r,col] of o.ghost) c.fillRect(col*cell+0.5, r*cell+0.5, cell-1, cell-1);
+    c.strokeStyle = '#fff'; c.lineWidth = 1.5;
+    for (const [r,col] of o.ghost) c.strokeRect(col*cell+1, r*cell+1, cell-2, cell-2);
+  }
+}
+function pieceGlyph(i, size, col) {
+  const cv = document.createElement('canvas');
+  const dpr = devicePixelRatio || 1; cv.width = size*dpr; cv.height = size*dpr;
+  cv.style.width = size+'px'; cv.style.height = size+'px';
+  const c = cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0);
+  const cells = S.info.piece_shapes[PIECES[i]];
+  const maxr = Math.max(...cells.map(p=>p[0]))+1, maxc = Math.max(...cells.map(p=>p[1]))+1;
+  const cs = Math.floor((size-6)/4);
+  const ox = (size - maxc*cs)/2, oy = (size - maxr*cs)/2;
+  c.fillStyle = col || COLORS[i+1];
+  for (const [r,cc] of cells) c.fillRect(ox+cc*cs+.5, oy+r*cs+.5, cs-1, cs-1);
+  return cv;
+}
+
+// ---------------------------------------------------------------- state & analysis
+async function refresh(keepSel=false) {
+  const seq = ++S.seq;
+  let A;
+  try { A = await api('/api/analyze', {board:S.board, current:S.current, next:S.next}); }
+  catch (e) { $('boardNote').innerHTML = `<span class="err">${e.message}</span>`; return; }
+  if (seq !== S.seq) return;
+  S.A = A;
+  if (!keepSel || S.sel >= A.n_legal) S.sel = A.dqn_choice ?? 0;
+  S.hover = null; S.pinned = null; S.hoverUnit = null;
+  renderAll();
+}
+function sortedIdx() {
+  const P = S.A.placements, idx = P.map((_,i)=>i);
+  if (S.sort==='q') idx.sort((a,b)=>P[b].q-P[a].q || a-b);
+  else if (S.sort==='h') idx.sort((a,b)=>P[b].heuristic_score-P[a].heuristic_score || P[b].q-P[a].q);
+  else idx.sort((a,b)=>P[a].rotation-P[b].rotation || P[a].column-P[b].column);
+  return idx;
+}
+function hChoice() {
+  const A=S.A; if (!A || !A.heuristic_choices.length) return null;
+  return A.heuristic_choices.includes(A.dqn_choice) ? A.dqn_choice : A.heuristic_choices[0];
+}
+function renderAll() {
+  renderBoardPanel(); renderCandidates(); renderCompare(); renderNetwork(); renderHeader();
+}
+function renderHeader() {
+  const m = S.info.checkpoint, n = S.info.network;
+  const hid = n.hidden_sizes.join('→');
+  $('chipArch').innerHTML = `<b>${n.input_dim}</b> → ${n.use_layer_norm?'LayerNorm → ':''}<b>${hid}</b> → <b>1</b> · ${n.total_params.toLocaleString()} params`;
+  const bits = [];
+  if (m.total_steps != null) bits.push(`${m.total_steps.toLocaleString()} steps`);
+  if (m.best_eval_score != null) bits.push(`best eval ${m.best_eval_score.toLocaleString()}`);
+  bits.push(m.double_dqn ? 'Double DQN' : 'DQN');
+  $('chipTrain').innerHTML = bits.join(' · ');
+}
+
+// ---- left board panel
+function renderBoardPanel() {
+  const A = S.A, cell = 22;
+  const idx = S.hover ?? S.sel;
+  const p = A && A.placements[idx];
+  drawBoard($('boardCanvas'), S.board, cell, {
+    ghost: p ? p.cells : null, ghostColor: hexA(COLORS[S.current+1], .55),
+  });
+  const full = [...Array(H).keys()].filter(r => [...Array(W).keys()].every(c => S.board[r*W+c] !== '0')).length;
+  $('boardNote').innerHTML = (S.edit ? '<b>Edit mode:</b> click / drag cells to toggle. ' : '') +
+    (full ? `<span class="err">${full} complete row(s): they clear on the next lock.</span>` : '');
+  $('btnEdit').classList.toggle('on', S.edit);
+  $('boardCanvas').style.cursor = S.edit ? 'crosshair' : 'default';
+  for (const [host, key, cls] of [['curPick','current','sel'],['nextPick','next','selnext']]) {
+    const el = $(host); el.innerHTML = '';
+    PIECES.forEach((nm, i) => {
+      const b = document.createElement('button');
+      b.className = 'piecebtn' + (S[key]===i ? ' '+cls : ''); b.title = nm;
+      b.appendChild(pieceGlyph(i, 22));
+      b.onclick = () => { S[key] = i; refresh(true); };
+      el.appendChild(b);
+    });
+  }
+  $('gameStats').textContent = S.pieces || S.score || S.lines ? `pieces placed ${S.pieces} · score ${S.score} · lines ${S.lines}` : '';
+}
+function hexA(hex, a) { const n=parseInt(hex.slice(1),16); return `rgba(${n>>16},${(n>>8)&255},${n&255},${a})`; }
+
+// ---- center: candidates
+function renderCandidates() {
+  const A = S.A, grid = $('grid');
+  grid.innerHTML = '';
+  if (!A.n_legal) { $('candTitle').textContent = 'No legal placements (game over)'; drawBars(); return; }
+  $('candTitle').textContent = `${A.n_legal} legal placements for piece ${PIECES[A.current]} (next: ${PIECES[A.next]})`;
+  const hset = new Set(A.heuristic_choices);
+  for (const i of sortedIdx()) {
+    const p = A.placements[i];
+    const d = document.createElement('div');
+    d.className = 'cand' + (i===S.sel?' sel':'') + (i===A.dqn_choice?' dqn':'') + (hset.has(i)?' heur':'');
+    const cv = document.createElement('canvas');
+    drawBoard(cv, p.result_board, 7, {placed:p.placed_after_clear});
+    d.appendChild(cv);
+    d.insertAdjacentHTML('beforeend',
+      `<div class="q">${fmtq(p.q)}</div><div class="sub">#${p.q_rank} · r${p.rotation} c${p.column}</div>`);
+    if (i===A.dqn_choice) d.insertAdjacentHTML('afterbegin','<span class="badge d">DQN</span>');
+    if (hset.has(i)) d.insertAdjacentHTML('afterbegin','<span class="badge h">HEUR</span>');
+    if (p.lines_cleared) d.insertAdjacentHTML('beforeend',`<span class="badge clr">${p.lines_cleared} line${p.lines_cleared>1?'s':''}</span>`);
+    d.onclick = () => { S.sel = i; S.pinned = null; renderBoardPanel(); renderCandidates(); renderCompare(); renderNetwork(); };
+    d.onmouseenter = () => { S.hover = i; renderBoardPanel(); };
+    d.onmouseleave = () => { S.hover = null; renderBoardPanel(); };
+    grid.appendChild(d);
+  }
+  drawBars();
+}
+function drawBars() {
+  const cv = $('qbars'), A = S.A, dpr = devicePixelRatio||1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  cv.width = w*dpr; cv.height = h*dpr;
+  const c = cv.getContext('2d'); c.setTransform(dpr,0,0,dpr,0,0); c.clearRect(0,0,w,h);
+  if (!A || !A.n_legal) return;
+  const order = sortedIdx(), P = A.placements;
+  const qs = P.map(p=>p.q), lo = Math.min(0, ...qs), hi = Math.max(0, ...qs);
+  const padT=14, padB=16, plotH = h-padT-padB;
+  const y = v => padT + (hi - v) / (hi - lo || 1) * plotH;
+  const bw = (w-30) / order.length;
+  c.fillStyle = '#8c96b0'; c.font = '10px sans-serif';
+  c.fillText(fmtq(hi), 2, padT-3); if (lo<0) c.fillText(fmtq(lo), 2, h-4);
+  c.strokeStyle = '#2a3550'; c.beginPath(); c.moveTo(26, y(0)); c.lineTo(w, y(0)); c.stroke();
+  const hset = new Set(A.heuristic_choices);
+  S.barGeom = [];
+  order.forEach((i, k) => {
+    const x = 28 + k*bw, v = P[i].q, y0 = y(0), y1 = y(v);
+    c.fillStyle = i===A.dqn_choice ? '#f5b301' : (i===S.sel ? '#ffffff' : '#4a6fb5');
+    c.fillRect(x+1, Math.min(y0,y1), Math.max(1,bw-2), Math.abs(y1-y0)||1);
+    if (hset.has(i)) { c.fillStyle='#35c2f0'; c.beginPath(); c.moveTo(x+bw/2, padT-2); c.lineTo(x+bw/2-4, padT-9); c.lineTo(x+bw/2+4, padT-9); c.fill(); }
+    if (i===S.sel) { c.strokeStyle='#fff'; c.strokeRect(x+.5, padT-1, bw-1, plotH+2); }
+    S.barGeom.push([x, x+bw, i]);
+  });
+  c.fillStyle = '#8c96b0'; c.fillText('Q(s,a) per placement — ▼ = heuristic pick', 30, h-3);
+}
+$('qbars').addEventListener('click', e => {
+  const x = e.offsetX; const g = (S.barGeom||[]).find(g => x>=g[0] && x<g[1]);
+  if (g) { S.sel = g[2]; renderAll(); }
+});
+
+// ---- right: compare
+function renderCompare() {
+  const A = S.A, el = $('cmp');
+  if (!A.n_legal) { el.innerHTML = '<div class="muted">No legal moves.</div>'; return; }
+  const di = A.dqn_choice, hi = hChoice();
+  const D = A.placements[di], Hh = A.placements[hi];
+  const ties = A.heuristic_choices.length;
+  let v;
+  if (A.agree) v = `<div class="verdict agree">✓ Agree: both choose rotation ${D.rotation}, column ${D.column}${ties>1?` <span class="muted small">(heuristic has ${ties} tied best moves)</span>`:''}</div>`;
+  else v = `<div class="verdict dis">✗ Disagree. The DQN's pick ranks <b>#${D.heuristic_rank}</b> by the heuristic; the heuristic's pick ranks <b>#${Hh.q_rank}</b> by the DQN's Q-value (Q ${fmtq(Hh.q)} vs ${fmtq(D.q)}).${ties>1?` <span class="muted small">(${ties} tied heuristic moves; the agent breaks ties randomly)</span>`:''}</div>`;
+  const row = (lab, a, b, f=x=>x) => `<tr><td>${lab}</td><td>${f(a)}</td><td>${f(b)}</td></tr>`;
+  el.innerHTML = v + `
+    <div class="cmpboards">
+      <div id="cmpD"><div style="color:var(--gold);font-weight:700">DQN pick</div></div>
+      <div id="cmpH"><div style="color:var(--cyan);font-weight:700">Heuristic pick</div></div>
+    </div>
+    <table class="cmp">
+      <tr><th></th><th style="color:var(--gold)">DQN</th><th style="color:var(--cyan)">Heur.</th></tr>
+      ${row('Rotation / column', `${D.rotation} / ${D.column}`, `${Hh.rotation} / ${Hh.column}`)}
+      ${row('Q-value', D.q, Hh.q, fmtq)}
+      ${row('Q rank', '#'+D.q_rank, '#'+Hh.q_rank)}
+      ${row('Heuristic score', D.heuristic_score, Hh.heuristic_score, x=>x.toFixed(2))}
+      ${row('Heuristic rank', '#'+D.heuristic_rank, '#'+Hh.heuristic_rank)}
+      ${row('Lines cleared', D.lines_cleared, Hh.lines_cleared)}
+      ${row('Holes', D.holes, Hh.holes)}
+      ${row('Aggregate height', D.aggregate_height, Hh.aggregate_height)}
+      ${row('Bumpiness', D.bumpiness, Hh.bumpiness)}
+      ${row('Max height', D.max_height, Hh.max_height)}
+    </table>
+    <div class="help">Heuristic score = ${S.info.heuristic_weights.lines_cleared}·lines ${S.info.heuristic_weights.aggregate_height}·height ${S.info.heuristic_weights.holes}·holes ${S.info.heuristic_weights.bumpiness}·bumpiness (from <code>HeuristicAgent</code>).</div>`;
+  for (const [id, p, i] of [['cmpD', D, di], ['cmpH', Hh, hi]]) {
+    const cv = document.createElement('canvas');
+    drawBoard(cv, p.result_board, 11, {placed:p.placed_after_clear});
+    $(id).appendChild(cv);
+    $(id).onclick = () => { S.sel = i; renderAll(); };
+  }
+}
+
+// ---------------------------------------------------------------- network view
+const lerp = (a,b,t) => a+(b-a)*t;
+function unitColor(v, scale) {
+  let t = Math.max(-1, Math.min(1, v/scale)); const s = Math.sign(t); t = Math.sqrt(Math.abs(t));
+  const bg=[22,28,42], hot = s>=0 ? [255,138,61] : [74,163,255], white=[255,236,200];
+  const base = t<.7 ? [lerp(bg[0],hot[0],t/.7),lerp(bg[1],hot[1],t/.7),lerp(bg[2],hot[2],t/.7)]
+                    : [lerp(hot[0],white[0],(t-.7)/.3),lerp(hot[1],white[1],(t-.7)/.3),lerp(hot[2],white[2],(t-.7)/.3)];
+  return `rgb(${base[0]|0},${base[1]|0},${base[2]|0})`;
+}
+function stageScale(st) {
+  if (st._scale != null) return st._scale;
+  const all = []; for (const row of st.values) for (const v of row) all.push(Math.abs(v));
+  all.sort((a,b)=>a-b);
+  st._scale = Math.max(1e-6, all[Math.floor(all.length*0.995)] || all[all.length-1] || 1);
+  return st._scale;
+}
+function linOfStage(si) { return si - (S.info.network.use_layer_norm ? 2 : 1); }
+function unitName(si, i) {
+  const st = S.A.stages[si];
+  if (st.name==='input' || st.name==='layernorm') return S.info.feature_names[i];
+  return `${st.label.replace(' (ReLU)','')} #${i}`;
+}
+function contribs(li, a, j) {  // incoming contributions to unit j of linear li, input activations a
+  const L = S.weights.layers[li], out = [];
+  const Wm = L._W || (L._W = b64f32(L.W)); const row = j*L.in;
+  for (let i=0;i<L.in;i++) out.push(Wm[row+i]*a[i]);
+  return out;
+}
+function bias(li) { const L=S.weights.layers[li]; return L._b || (L._b = b64f32(L.b)); }
+
+let NET = null; // geometry for hit-testing
+let NETC = null; // cached offscreen render of everything except hover overlays
+function renderNetwork() {
+  const A = S.A, cv = $('netCanvas');
+  if (!A || !A.n_legal) { $('netTitle').textContent = 'Network'; cv.getContext('2d').clearRect(0,0,cv.width,cv.height); $('netinfo').innerHTML=''; return; }
+  const p = A.placements[S.sel];
+  $('netTitle').innerHTML = `Network forward pass for placement #${S.sel} — piece ${PIECES[A.current]}, rotation ${p.rotation}, column ${p.column} → <span style="color:var(--gold)">Q = ${fmtq(p.q)}</span>${S.sel===A.dqn_choice?' (DQN choice)':''}`;
+  const dpr = devicePixelRatio||1, Wd = cv.clientWidth, Hd = cv.clientHeight;
+  cv.width = Wd*dpr; cv.height = Hd*dpr;
+  const main = cv.getContext('2d'); main.setTransform(dpr,0,0,dpr,0,0); main.clearRect(0,0,Wd,Hd);
+  const st = A.stages, n = st.length;
+  const left = 120, right = 70, top = 64, bottom = Hd-34, stripW = 22, sh = bottom-top;
+  const xs = st.map((_,i)=> left + i*(Wd-left-right-stripW)/(n-1));
+  const dim = i => st[i].values[0].length;
+  const yOf = (si, u) => dim(si)===1 ? (top+bottom)/2 : top + (u+.5)*sh/dim(si);
+  NET = {xs, stripW, top, sh, dim, yOf, st};
+  const key = [S.seq, S.sel, S.edgeK, Wd, Hd, S.info.checkpoint.path].join('|');
+  if (!NETC || NETC.key !== key) {
+    const off = document.createElement('canvas'); off.width = Wd*dpr; off.height = Hd*dpr;
+    const oc = off.getContext('2d'); oc.setTransform(dpr,0,0,dpr,0,0);
+    drawNetBase(oc, Wd, Hd);
+    NETC = {key, off};
+  }
+  main.drawImage(NETC.off, 0, 0, Wd, Hd);
+  drawNetOverlay(main);
+  renderNetInfo();
+}
+function drawNetOverlay(c) {
+  const {xs, stripW, yOf, st} = NET;
+  const focus = S.pinned || S.hoverUnit;
+  if (focus && linOfStage(focus.si) >= 0) {
+    const li = linOfStage(focus.si), a = st[focus.si-1].values[S.sel];
+    const cs = contribs(li, a, focus.u);
+    const ord = cs.map((v,i)=>[Math.abs(v),i]).sort((x,y)=>y[0]-x[0]).slice(0, 14);
+    for (const [av, i] of ord) {
+      const x0 = xs[focus.si-1]+stripW, x1 = xs[focus.si], y0 = yOf(focus.si-1,i), y1 = yOf(focus.si,focus.u);
+      c.strokeStyle = cs[i]>=0 ? '#8cffc6' : '#ff9aa9'; c.lineWidth = 1.8;
+      c.beginPath(); c.moveTo(x0,y0); c.bezierCurveTo(x0+(x1-x0)*.5,y0,x0+(x1-x0)*.5,y1,x1,y1); c.stroke();
+      c.strokeStyle = '#fff'; c.lineWidth = 1; c.strokeRect(xs[focus.si-1]-1, y0-1.5, stripW+2, 3);
+    }
+  }
+  if (S.hoverUnit) { const {si,u}=S.hoverUnit; c.strokeStyle='#ffe29a'; c.lineWidth=1.5; c.strokeRect(xs[si]-2, yOf(si,u)-2.5, stripW+4, 5); }
+  if (S.pinned) { const {si,u}=S.pinned; c.strokeStyle='#fff'; c.lineWidth=2; c.strokeRect(xs[si]-3, yOf(si,u)-3.5, stripW+6, 7); }
+}
+function drawNetBase(c, Wd, Hd) {
+  const {xs, stripW, top, sh, dim, yOf, st} = NET, n = st.length, bottom = top+sh;
+  // edges
+  const base = S.info.network.use_layer_norm ? 1 : 0;
+  const nLin = S.weights.layers.length;
+  const edgeInfo = [];
+  for (let li=0; li<nLin; li++) {
+    const from = base+li, to = from+1;
+    const a = st[from].values[S.sel], L = S.weights.layers[li];
+    const Wm = L._W || (L._W = b64f32(L.W));
+    const last = li === nLin-1;
+    const K = last ? L.in : S.edgeK;
+    if (K<=0) continue;
+    const m = L.in*L.out, absv = new Float32Array(m), cc = new Float32Array(m);
+    for (let j=0;j<L.out;j++) for (let i=0;i<L.in;i++) { const v = Wm[j*L.in+i]*a[i]; cc[j*L.in+i]=v; absv[j*L.in+i]=Math.abs(v); }
+    const thr = Float32Array.from(absv).sort()[Math.max(0, m-K)];
+    let mx = 1e-9; for (let k=0;k<m;k++) if (absv[k]>mx) mx=absv[k];
+    c.lineCap='round';
+    let drawn=0;
+    for (let k=0;k<m && drawn<K;k++) {
+      if (absv[k] < thr || absv[k]===0) continue;
+      drawn++;
+      const j = (k/L.in)|0, i = k%L.in, f = absv[k]/mx;
+      const x0 = xs[from]+stripW, x1 = xs[to], y0 = yOf(from,i), y1 = yOf(to,j);
+      c.strokeStyle = cc[k]>=0 ? `rgba(61,220,151,${.18+.7*f})` : `rgba(255,93,115,${.18+.7*f})`;
+      c.lineWidth = .5 + 2.2*f;
+      c.beginPath(); c.moveTo(x0,y0); c.bezierCurveTo(x0+(x1-x0)*.5,y0,x0+(x1-x0)*.5,y1,x1,y1); c.stroke();
+    }
+    edgeInfo.push({li, mx});
+  }
+
+  // strips
+  st.forEach((s, si) => {
+    const x = xs[si], vals = s.values[S.sel], sc = stageScale(s), d = vals.length;
+    if (d === 1) {
+      c.fillStyle = '#f5b301'; c.fillRect(x-14, (top+bottom)/2-18, stripW+28, 36);
+      c.fillStyle = '#111'; c.font = 'bold 14px sans-serif'; c.textAlign='center';
+      c.fillText(fmtq(vals[0]), x+stripW/2, (top+bottom)/2+5);
+    } else {
+      const ch = sh/d;
+      for (let u=0;u<d;u++) { c.fillStyle = unitColor(vals[u], sc); c.fillRect(x, top+u*ch, stripW, Math.max(1,ch)); }
+      c.strokeStyle='#2a3550'; c.strokeRect(x-.5, top-.5, stripW+1, sh+1);
+    }
+    c.textAlign='center'; c.fillStyle='#e7eaf3'; c.font='bold 12px sans-serif';
+    c.fillText(s.label.replace(' (ReLU)',''), x+stripW/2, top-34);
+    c.fillStyle='#8c96b0'; c.font='11px sans-serif';
+    c.fillText(d===1 ? '1 value' : `${d} units`, x+stripW/2, top-20);
+    if (si>=base+1 && si<n) {
+      const li = si-base-1, L = S.weights.layers[li];
+      c.fillText(`${L.in}→${L.out}${si<n-1?' · ReLU':''}`, x+stripW/2, top-6);
+    } else if (s.name==='layernorm') c.fillText('(x−μ)/σ·γ+β', x+stripW/2, top-6);
+    else if (s.name==='input') c.fillText('φ(s,a)', x+stripW/2, top-6);
+  });
+  // LayerNorm hint between input and LN
+  if (S.info.network.use_layer_norm) {
+    c.fillStyle='#8c96b0'; c.font='11px sans-serif'; c.textAlign='center';
+    const xm = (xs[0]+stripW+xs[1])/2;
+    c.fillText('per-feature normalize →', xm, (top+bottom)/2); c.fillText('(element-wise)', xm, (top+bottom)/2+14);
+  }
+  // input group brackets
+  c.textAlign='right'; c.font='11px sans-serif';
+  for (const g of S.info.feature_groups) {
+    const y0 = yOf(0,g.start)-sh/dim(0)/2, y1 = yOf(0,g.start+g.size-1)+sh/dim(0)/2;
+    c.strokeStyle = GROUP_COL[g.key]; c.lineWidth = 3;
+    c.beginPath(); c.moveTo(xs[0]-5, y0+.5); c.lineTo(xs[0]-5, y1-.5); c.stroke();
+    c.fillStyle = GROUP_COL[g.key];
+    const short = {board:'board 20×10', current:'cur. piece', next:'next piece', heights:'heights', scalars:'metrics'}[g.key];
+    c.fillText(`${short} (${g.size})`, xs[0]-11, (y0+y1)/2 + (g.key==='board'?0:({current:-6,next:6,heights:3,scalars:12})[g.key]) + 4);
+  }
+  c.textAlign='left';
+}
+function renderNetInfo() {
+  const A = S.A, p = A.placements[S.sel], st = A.stages, el = $('netinfo');
+  const nLin = S.weights.layers.length, base = S.info.network.use_layer_norm ? 1 : 0;
+  // Q breakdown from the last Linear layer
+  const li = nLin-1, a = st[base+li].values[S.sel], cs = contribs(li, a, 0), b = bias(li)[0];
+  const tot = cs.reduce((x,y)=>x+y,0), posS = cs.filter(v=>v>0).reduce((x,y)=>x+y,0), negS = cs.filter(v=>v<0).reduce((x,y)=>x+y,0);
+  const top5 = cs.map((v,i)=>[v,i]).sort((x,y)=>Math.abs(y[0])-Math.abs(x[0])).slice(0,5);
+  let h = `<h3>Q-value breakdown (output layer)</h3>
+    <table>
+      <tr><td>Σ positive contributions</td><td class="pos">${fmt(posS)}</td></tr>
+      <tr><td>Σ negative contributions</td><td class="neg">${fmt(negS)}</td></tr>
+      <tr><td>bias</td><td>${fmt(b)}</td></tr>
+      <tr><td><b>Q = Σ wₖ·hₖ + b</b></td><td><b>${fmtq(tot+b)}</b></td></tr>
+      <tr><td class="muted">network output (PyTorch)</td><td class="muted">${fmtq(p.q)}</td></tr>
+    </table>
+    <div class="muted" style="margin-top:4px">Top contributors (hidden 3 units):</div>
+    <table>${top5.map(([v,i])=>`<tr><td>unit #${i} (act ${a[i].toFixed(2)})</td><td class="${v>=0?'pos':'neg'}">${fmt(v)}</td></tr>`).join('')}</table>`;
+  const f = S.hoverUnit || S.pinned;
+  if (f) h = unitInfo(f) + h;
+  const names = S.info.feature_groups.find(g=>g.key==='scalars');
+  h += `<h3>Scalar input features for this placement</h3><table>` +
+    S.info.feature_names.slice(names.start, names.start+names.size).map((nm,i)=>`<tr><td>${nm}</td><td>${p.scalar_features[i].toFixed(4)}</td></tr>`).join('') + '</table>';
+  h += `<div class="help">Colour scale per layer (shared across all candidates, so you can compare placements): <span style="color:#4aa3ff">blue</span> negative, <span style="color:#ff8a3d">orange</span> positive.</div>`;
+  el.innerHTML = h;
+}
+function unitInfo(f) {
+  const st = S.A.stages, s = st[f.si], v = s.values[S.sel][f.u];
+  const isPin = S.pinned && S.pinned.si===f.si && S.pinned.u===f.u;
+  let h = `<h3>${isPin?'📌 ':''}${s.label.replace(' (ReLU)','')} · unit ${f.u}</h3><table>`;
+  if (s.name==='input' || s.name==='layernorm') {
+    h += `<tr><td colspan=2>${S.info.feature_names[f.u]}</td></tr>`;
+    h += `<tr><td>${s.name==='input'?'value':'normalized value'}</td><td>${v.toFixed(4)}</td></tr>`;
+    if (s.name==='layernorm') h += `<tr><td>raw input</td><td>${st[0].values[S.sel][f.u].toFixed(4)}</td></tr>`;
+  } else if (s.name==='output') {
+    h += `<tr><td>Q(s,a)</td><td>${fmtq(v)}</td></tr>`;
+  } else {
+    const li = linOfStage(f.si), a = st[f.si-1].values[S.sel], cs = contribs(li, a, f.u), b = bias(li)[f.u];
+    const pre = cs.reduce((x,y)=>x+y,0) + b;
+    h += `<tr><td>pre-activation Σwᵢaᵢ + b</td><td>${fmt(pre,3)}</td></tr><tr><td>after ReLU</td><td>${v.toFixed(3)}${pre<=0?' <span class="muted">(inactive)</span>':''}</td></tr></table>`;
+    const ord = cs.map((x,i)=>[x,i]).sort((x,y)=>Math.abs(y[0])-Math.abs(x[0])).slice(0,6);
+    h += `<div class="muted">Strongest inputs (weight × activation):</div><table>` +
+      ord.map(([x,i])=>`<tr><td>${unitName(f.si-1,i)}</td><td class="${x>=0?'pos':'neg'}">${fmt(x,3)}</td></tr>`).join('');
+  }
+  return h + '</table>';
+}
+function unitAt(e) {
+  if (!NET) return null;
+  const r = $('netCanvas').getBoundingClientRect(), x = e.clientX-r.left, y = e.clientY-r.top;
+  for (let si=0; si<NET.xs.length; si++) {
+    if (x < NET.xs[si]-4 || x > NET.xs[si]+NET.stripW+4) continue;
+    const d = NET.dim(si);
+    if (d===1) { if (Math.abs(y-(NET.top+NET.top+NET.sh)/2) < 20) return {si,u:0}; continue; }
+    if (y<NET.top || y>NET.top+NET.sh) continue;
+    return {si, u: Math.min(d-1, Math.floor((y-NET.top)/NET.sh*d))};
+  }
+  return null;
+}
+$('netCanvas').addEventListener('mousemove', e => {
+  const u = unitAt(e);
+  const same = (S.hoverUnit&&u&&S.hoverUnit.si===u.si&&S.hoverUnit.u===u.u) || (!S.hoverUnit&&!u);
+  if (!same) { S.hoverUnit = u; renderNetwork(); }
+});
+$('netCanvas').addEventListener('mouseleave', () => { if (S.hoverUnit) { S.hoverUnit=null; renderNetwork(); } });
+$('netCanvas').addEventListener('click', e => {
+  const u = unitAt(e);
+  S.pinned = (u && !(S.pinned && S.pinned.si===u.si && S.pinned.u===u.u)) ? {...u, pinned:true} : null;
+  renderNetwork();
+});
+$('edgeK').addEventListener('input', e => { S.edgeK = +e.target.value; $('edgeKval').textContent = S.edgeK; if (S.A) renderNetwork(); });
+
+// ---------------------------------------------------------------- controls
+function applyState(st) {
+  S.board = st.board; S.current = st.current; S.next = st.next;
+  S.pieces = st.pieces_placed||0; S.score = st.score||0; S.lines = st.lines||0;
+}
+function applyDelta(st) {  // step / disagreement responses are relative to the state we sent
+  applyState({...st, pieces_placed: S.pieces + (st.pieces_placed||0), score: S.score + (st.score||0), lines: S.lines + (st.lines||0)});
+}
+async function busy(fn) {
+  if (S.busy) return; S.busy = true; document.body.style.cursor='progress';
+  try { await fn(); } catch (e) { alert(e.message); } finally { S.busy = false; document.body.style.cursor=''; }
+}
+$('btnGen').onclick = () => busy(async () => {
+  applyState(await api('/api/sample', {agent:$('genAgent').value, seed:+$('genSeed').value, pieces:+$('genPieces').value}));
+  await refresh();
+});
+$('btnDis').onclick = () => busy(async () => {
+  const r = await api('/api/disagreement', {board:S.board, current:S.current, next:S.next, seed:Math.floor(Math.random()*1e6)});
+  if (!r.found) { alert('No disagreement found: ' + r.reason + '.\nTry another state.'); return; }
+  applyDelta(r.state); await refresh();
+});
+$('btnClear').onclick = () => { S.board='0'.repeat(200); S.pieces=S.score=S.lines=0; refresh(true); };
+$('btnEdit').onclick = () => { S.edit = !S.edit; renderBoardPanel(); };
+async function play(idx) {
+  if (idx==null) return;
+  applyDelta(await api('/api/step', {board:S.board, current:S.current, next:S.next, index:idx}));
+  await refresh();
+}
+$('btnPlaySel').onclick = () => busy(() => play(S.A.n_legal ? S.sel : null));
+$('btnPlayDqn').onclick = () => busy(() => play(S.A.dqn_choice));
+$('btnPlayHeur').onclick = () => busy(() => play(hChoice()));
+$('sortSel').onchange = e => { S.sort = e.target.value; renderCandidates(); };
+
+// board editing
+let painting = null;
+function cellAt(e) { const r=$('boardCanvas').getBoundingClientRect(); return [Math.floor((e.clientY-r.top)/22), Math.floor((e.clientX-r.left)/22)]; }
+function paint(e) {
+  const [r,c] = cellAt(e); if (r<0||r>=H||c<0||c>=W) return;
+  const i = r*W+c; if (painting===null) painting = S.board[i]==='0' ? '8' : '0';
+  if (S.board[i] === painting) return;
+  S.board = S.board.slice(0,i)+painting+S.board.slice(i+1); renderBoardPanel();
+}
+$('boardCanvas').addEventListener('mousedown', e => { if (!S.edit) return; painting=null; paint(e); });
+$('boardCanvas').addEventListener('mousemove', e => { if (S.edit && e.buttons===1) paint(e); });
+window.addEventListener('mouseup', () => { if (painting!==null) { painting=null; S.pieces=S.score=S.lines=0; refresh(true); } });
+window.addEventListener('keydown', e => {
+  if (!S.A || !S.A.n_legal || /INPUT|SELECT/.test(document.activeElement.tagName)) return;
+  const ord = sortedIdx(), k = ord.indexOf(S.sel);
+  if (e.key==='ArrowRight') { S.sel = ord[Math.min(ord.length-1,k+1)]; renderAll(); e.preventDefault(); }
+  if (e.key==='ArrowLeft')  { S.sel = ord[Math.max(0,k-1)]; renderAll(); e.preventDefault(); }
+});
+window.addEventListener('resize', () => { if (S.A) { drawBars(); renderNetwork(); } });
+
+// checkpoints
+async function loadCheckpoints() {
+  const r = await api('/api/checkpoints'), sel = $('ckptSel');
+  sel.innerHTML = '';
+  const groups = {'★ Featured': r.checkpoints.filter(c => c.featured)};
+  for (const c of r.checkpoints) { const d = c.path.split('/').slice(0,-1).join('/'); (groups[d] ||= []).push(c); }
+  let picked = false;
+  for (const d of Object.keys(groups)) {
+    const og = document.createElement('optgroup'); og.label = d;
+    for (const c of groups[d]) { const o = document.createElement('option'); o.value = c.path;
+      o.textContent = (d.startsWith('★') ? c.featured : c.path.split('/').pop()) + `  (${c.size_mb} MB)`;
+      if (c.path===r.current && !picked && (d.startsWith('★') || !c.featured)) { o.selected = true; picked = true; }
+      og.appendChild(o); }
+    if (groups[d].length) sel.appendChild(og);
+  }
+}
+$('ckptSel').onchange = e => busy(async () => {
+  await api('/api/load', {path:e.target.value});
+  S.info = await api('/api/info'); S.weights = await api('/api/weights');
+  for (const st of (S.A?.stages||[])) delete st._scale;
+  await refresh(true);
+});
+
+async function init() {
+  S.info = await api('/api/info'); S.weights = await api('/api/weights');
+  await loadCheckpoints();
+  // Optional URL params: ?agent=heuristic&seed=11&pieces=26&disagree=1&sort=q
+  const q = new URLSearchParams(location.search);
+  if (q.has('sort')) { S.sort = q.get('sort'); $('sortSel').value = S.sort; }
+  if (q.has('pieces') || q.has('seed')) {
+    if (q.has('agent')) $('genAgent').value = q.get('agent');
+    if (q.has('seed')) $('genSeed').value = q.get('seed');
+    if (q.has('pieces')) $('genPieces').value = q.get('pieces');
+    applyState(await api('/api/sample', {agent:q.get('agent')||'heuristic', seed:+(q.get('seed')||7), pieces:+(q.get('pieces')||18)}));
+    if (q.get('disagree')) {
+      const r = await api('/api/disagreement', {board:S.board, current:S.current, next:S.next, seed:1});
+      if (r.found) applyDelta(r.state);
+    }
+  } else {
+    // start from a state where the DQN and heuristic differ (falls back to a plain mid-game board)
+    try {
+      const r = await api('/api/disagreement', {board:'0'.repeat(200), current:2, next:0, seed:1});
+      if (r.found) applyState(r.state); else applyState(await api('/api/sample', {agent:'heuristic', seed:7, pieces:18}));
+    } catch (e) { applyState(await api('/api/sample', {agent:'heuristic', seed:7, pieces:18})); }
+  }
+  await refresh();
+}
+init().catch(e => { document.body.insertAdjacentHTML('afterbegin', `<pre class="err">${e.message}</pre>`); });
+</script>
+</body>
+</html>
