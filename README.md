@@ -60,12 +60,14 @@ flowchart TB
 | `tetris_rl/rewards.py` | Configurable shaped training rewards |
 | `tetris_rl/environment.py` | Gymnasium env + legal-action mask |
 | `tetris_rl/agents/` | Random, heuristic, DQN |
-| `tetris_rl/training/` | Replay buffer + training CLI |
+| `tetris_rl/training/` | Replay buffer, training CLI, heuristic demos / behaviour cloning (`demos.py`), imitation loss (`imitation.py`), diagnostics |
 | `tetris_rl/evaluation/` | Seeded evaluation and comparison |
 | `tetris_rl/ui/pygame_app.py` | Human play + AI watch mode |
-| `tests/` | pytest suite |
+| `scripts/` | Experiment runners, analysis and verification scripts |
+| `tests/` | pytest suite (87 tests) |
 | `models/` | Checkpoints |
-| `results/` | Logs, CSVs, charts |
+| `results/` | Logs, CSVs, charts, experiment reports (gitignored) |
+| `docs/images/` | Charts embedded in this README |
 
 ## Installation
 
@@ -117,6 +119,20 @@ python -m tetris_rl.training.train_dqn --preset original --episodes 400 --seed 4
 ```
 
 Useful flags: `--device cpu|mps|cuda`, `--resume PATH`, `--double-dqn` / `--no-double-dqn`, `--no-tb`.
+
+**Imitation-regularized fine-tuning** (step-budget mode; starts from a behaviour-cloned checkpoint, keeps a cross-entropy loss on persistent heuristic demonstrations active during RL):
+
+```bash
+python -m tetris_rl.training.train_dqn --preset improved --reward-mode delta --seed 42 \
+  --init-from models/exp_guided/B_bc/seed42/dqn_best.pt \
+  --demo-path results/exp_demos/heuristic_demos_train.npz \
+  --demo-val-path results/exp_demos/heuristic_demos_val.npz --demo-prefill \
+  --imitation-weight 0.1 --epsilon-start 0.05 --epsilon-end 0.05 \
+  --max-steps 10000 --eval-at-steps 1000,2500,5000,7500,10000 --eval-at-start \
+  --train-seed-base 400000 --checkpoint-dir models/my_run --log-dir results/my_run
+```
+
+New flags: `--init-from` (weights + Adam only; counters/ε/buffer fresh), `--imitation-weight λ` (0 = log the imitation loss without optimising it), `--imitation-batch-size`, `--grad-diag-every`, `--train-seed-base`, `--eval-at-steps`. Expert demonstration collection and behaviour-cloning steps are not counted as RL environment steps.
 
 - Checkpoints: `models/*/dqn_best.pt`, `dqn_latest.pt`, `dqn_final.pt`
 - Equal-budget A/B script: `bash scripts/run_ab_experiment.sh 400`
@@ -196,7 +212,7 @@ Variable legal placements each turn, encoded as indices `0 .. n_legal-1` with a 
 pytest -q
 ```
 
-Coverage includes engine, env, rewards (including audit fixes), DQN forward/Double-DQN update, and checkpoint save/load.
+Coverage includes engine, env, rewards (including audit fixes), DQN forward/Double-DQN update, checkpoint save/load, and the imitation loss (legal-action masking, no gradient to the target network, λ=0 equivalent to plain DQN, checkpoint-init fidelity, seed-range disjointness).
 
 ## Measured results (executed locally)
 
@@ -217,7 +233,7 @@ Protocol: `--seed 0`, `--max-pieces 500`, ε=0 for DQN agents.
 
 **Findings (measured, not claimed beyond this):**
 - Improved DQN beats original DQN and random on this protocol.
-- Neither DQN approaches the heuristic within this budget; heuristic rarely tops out before the 500-piece cap.
+- Neither from-scratch DQN approaches the heuristic within this budget; heuristic rarely tops out before the 500-piece cap. (Behaviour cloning plus imitation-regularized fine-tuning does; see the latest result below.)
 - Artifacts: `results/ab_comparison/` (CSV/JSON + charts). Code audit: `results/AUDIT.md`.
 
 ### Reproduce
@@ -230,11 +246,36 @@ python -m tetris_rl.evaluation.compare_ab --games 100 --seed 0 \
   --improved-model models/improved/dqn_best.pt
 ```
 
+### Latest result — imitation-regularized Double DQN
+
+A DQN trained from scratch scores ~1,000 on the validation games above. Behaviour-cloning the heuristic reaches ~21,000 (the "clone"), but ordinary DQN fine-tuning then drifts away from the expert. Adding a persistent imitation loss, `L = L_TD + λ·L_imit` (cross-entropy over legal placements against the heuristic's choice), lets RL improve on the clone: with λ=0.1 the validation score rises above both the clone and the heuristic.
+
+![Validation score vs RL steps](docs/images/imitation_val_score.png)
+
+*Mean (top) and median (bottom) greedy validation score over 50 fixed games vs RL environment steps, for seeds 42 and 43. Dashed line = clone at step 0, dotted = 85% of clone, dash-dot = heuristic. Reward, network and all other hyper-parameters are identical across arms; only λ differs.*
+
+| Agent (10k RL steps) | Seed 42 | Seed 43 |
+|---|---|---|
+| Behaviour clone (no RL) | 20,972 | 21,272 |
+| Standard DQN (λ=0) | 22,292 | 21,838 |
+| Imitation-regularized, λ=0.1 | **24,612** | **25,926** |
+| Imitation-regularized, λ=1.0 | 21,104 | 22,166 |
+
+Caveats: two seeds, validation seeds only (no held-out test evaluation yet), and mean score alone hides risk — λ=0 reaches its score with 32–40% top-out versus 4–18% for λ=0.1. λ=1.0 preserves the clone's behaviour but does not significantly improve on it. Full analysis, loss-scale checks, and all diagnostics: [`results/reports/imitation_regularized_dqn_experiment.md`](results/reports/imitation_regularized_dqn_experiment.md) (local; `results/` is gitignored).
+
+Reproduce (needs the demos and behaviour-clone checkpoints from `scripts/collect_heuristic_demos.py` / `scripts/run_guided_experiment.py`):
+
+```bash
+python scripts/run_imitation_experiment.py --tag exp_imitreg --parallel 6
+python scripts/analyze_imitation_experiment.py
+```
+
 ## Limitations and next steps
 
 - No HOLD / full SRS / T-spins / combo scoring
 - Placement actions only
-- Heuristic still much stronger; try longer `--episodes 5000`, prioritized replay, or PPO
-- Resume training does not restore the replay buffer
+- From-scratch DQN is still far weaker than the heuristic; the strong agents here start from a behaviour clone of the heuristic, so the clone's skill is imitation, and only the gain above it (about +17–22% with λ=0.1 on validation seeds) is attributable to RL
+- Imitation-regularization results use two seeds, 10k RL steps and validation seeds only; replicate with more seeds, test a λ grid / DQfD-style margin loss or advantage-weighted imitation, and evaluate one chosen checkpoint once on the held-out test seeds
+- `--resume` restores the replay buffer, so `dqn_final.pt` / `dqn_latest.pt` can be hundreds of MB; experiment checkpoints (`models/exp_*/`, `models/frozen/`) are gitignored because GitHub rejects files over 100 MB
 - Eval `--max-pieces` cap inflates heuristic “survival” vs natural top-out
 
